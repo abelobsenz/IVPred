@@ -254,6 +254,62 @@ def _surface_forecast_error_profiles(
     return pd.DataFrame(rows_dte), pd.DataFrame(rows_x), pd.DataFrame(rows_grid)
 
 
+def _calibrate_regime_surface_blend(
+    *,
+    obs_surface: np.ndarray,
+    model_surface: np.ndarray,
+    tree_surface: np.ndarray,
+    asset_ids: np.ndarray,
+    shrinkage: float = 30.0,
+    gate_temperature: float = 0.20,
+) -> np.ndarray:
+    """Estimate per-asset/per-grid blending weights using validation residual risk.
+
+    Weight convention: blended = w * model + (1 - w) * tree.
+    """
+    obs = np.asarray(obs_surface, dtype=np.float64)
+    pred_m = np.asarray(model_surface, dtype=np.float64)
+    pred_t = np.asarray(tree_surface, dtype=np.float64)
+    aids = np.asarray(asset_ids, dtype=np.int32).reshape(-1)
+    if obs.shape != pred_m.shape or obs.shape != pred_t.shape:
+        raise RuntimeError(
+            "Blend calibration shape mismatch: "
+            f"obs={obs.shape} model={pred_m.shape} tree={pred_t.shape}."
+        )
+    if obs.ndim != 3 or len(aids) != obs.shape[0]:
+        raise RuntimeError(
+            "Blend calibration expects [n_days, nx, nt] surfaces and matching asset_ids."
+        )
+
+    n_assets = int(max(np.max(aids) + 1, 1)) if len(aids) else 1
+    nx = int(obs.shape[1])
+    nt = int(obs.shape[2])
+    w = np.full((n_assets, nx, nt), 0.5, dtype=np.float64)
+
+    err_m = (pred_m - obs) ** 2
+    err_t = (pred_t - obs) ** 2
+    global_m = np.mean(err_m, axis=0)
+    global_t = np.mean(err_t, axis=0)
+    global_score = (global_t - global_m) / np.clip(global_m + global_t, 1e-10, None)
+
+    shrink = max(float(shrinkage), 0.0)
+    for aid in range(n_assets):
+        idx = np.where(aids == aid)[0]
+        if len(idx) == 0:
+            score = global_score
+        else:
+            local_m = np.mean(err_m[idx], axis=0)
+            local_t = np.mean(err_t[idx], axis=0)
+            local_score = (local_t - local_m) / np.clip(local_m + local_t, 1e-10, None)
+            lam = len(idx) / (len(idx) + shrink) if shrink > 0.0 else 1.0
+            score = lam * local_score + (1.0 - lam) * global_score
+
+        temp = max(float(gate_temperature), 1e-3)
+        w[aid] = 1.0 / (1.0 + np.exp(-np.clip(score / temp, -30.0, 30.0)))
+
+    return np.clip(w, 0.0, 1.0).astype(np.float32)
+
+
 def _resolve_num_workers(requested: int, n_tasks: int) -> int:
     if n_tasks <= 1:
         return 1
@@ -656,17 +712,19 @@ def evaluate(
     contract_mid_norm = contract_mid / np.clip(contract_forward, 1e-6, None)
 
     split_train_frac, split_val_frac, split_mode = _split_config_from_train_config(run_dir)
-    tr_dates, _, te_dates = _date_splits_for_mode(
+    tr_dates, va_dates, te_dates = _date_splits_for_mode(
         n_dates=n_dates,
         asset_ids=asset_ids,
         train_frac=split_train_frac,
         val_frac=split_val_frac,
         split_mode=split_mode,
     )
+    train_dates = tr_dates.astype(np.int32)
+    val_dates = va_dates.astype(np.int32)
     test_dates = te_dates.astype(np.int32)
     _assert_no_train_test_date_overlap(
         dates=dates,
-        train_idx=tr_dates.astype(np.int64),
+        train_idx=train_dates.astype(np.int64),
         test_idx=test_dates.astype(np.int64),
     )
     # Use inference_mode for lower overhead than no_grad during evaluation.
@@ -811,17 +869,15 @@ def evaluate(
     forecast_err_by_moneyness = pd.DataFrame()
     forecast_err_grid = pd.DataFrame()
     if len(forecast_entry_idx) > 0:
-        pred_forecast = forecast_iv[forecast_entry_idx]
+        pred_forecast = forecast_iv[forecast_entry_idx].astype(np.float32)
         obs_forecast = iv_surface_obs[forecast_target_idx]
-        metrics["surface_forecast_iv_rmse"] = rmse(pred_forecast, obs_forecast)
-        metrics["surface_forecast_iv_mae"] = mae(pred_forecast, obs_forecast)
 
         # Baseline: persistence (tomorrow's surface = today's surface).
         base_forecast_persistence = iv_surface_obs[forecast_entry_idx]
         metrics["surface_forecast_iv_rmse_baseline_persistence"] = rmse(base_forecast_persistence, obs_forecast)
         metrics["surface_forecast_iv_mae_baseline_persistence"] = mae(base_forecast_persistence, obs_forecast)
 
-        # Replacement baseline: tree-boosted next-day surface mapping trained on train+val only.
+        # Baseline: tree-boosted next-day surface mapping trained on train+val only.
         if tree_baseline_strict and HistGradientBoostingRegressor is None:
             raise RuntimeError(
                 "Tree baseline is unavailable because scikit-learn (HistGradientBoostingRegressor) "
@@ -845,6 +901,45 @@ def evaluate(
                 "Tree baseline produced no trained assets and would fall back entirely to persistence. "
                 "Refusing to continue in strict mode to avoid silent fallback."
             )
+
+        # Regime-adaptive residual blend: calibrate per-asset/per-grid weights on
+        # validation forecasts, then blend model and tree forecasts on test.
+        val_same_asset = same_asset_next & np.isin(np.arange(max(n_dates - 1, 0)), val_dates)
+        val_same_asset &= np.isin(np.arange(1, n_dates), val_dates)
+        val_entry_idx = np.where(val_same_asset)[0].astype(np.int32)
+        val_target_idx = val_entry_idx + 1
+        blend_family = "model_tree_validation_residual_blend"
+        blend_val_days = int(len(val_entry_idx))
+        blend_shrinkage = 30.0
+        blend_weight_by_asset_grid = np.empty((0, 0, 0), dtype=np.float32)
+
+        if len(val_entry_idx) > 0:
+            model_val = forecast_iv[val_entry_idx]
+            tree_val, _ = _tree_boost_surface_nextday_forecast(
+                iv_surface_obs=iv_surface_obs,
+                context_scaled=context_scaled,
+                asset_ids=asset_ids,
+                forecast_entry_idx=val_entry_idx,
+                x_grid=x_grid,
+                tenor_days=tenor_days,
+                train_date_mask=np.isin(np.arange(n_dates), train_dates),
+                min_history=int(max(60, baseline_min_history)),
+            )
+            blend_weight_by_asset_grid = _calibrate_regime_surface_blend(
+                obs_surface=iv_surface_obs[val_target_idx],
+                model_surface=model_val,
+                tree_surface=tree_val,
+                asset_ids=asset_ids[val_entry_idx],
+                shrinkage=blend_shrinkage,
+            )
+            blend_w_test = blend_weight_by_asset_grid[asset_ids[forecast_entry_idx]]
+            pred_forecast_blend = (
+                blend_w_test * pred_forecast + (1.0 - blend_w_test) * base_forecast_tree
+            ).astype(np.float32)
+        else:
+            pred_forecast_blend = 0.5 * (pred_forecast + base_forecast_tree)
+            blend_family = "model_tree_static_equal_blend"
+
         metrics["surface_forecast_baseline_primary"] = "tree_boost_surface_nextday"
         metrics["surface_forecast_baseline_tree_family"] = str(tree_meta.get("family", "tree_boost_surface_nextday"))
         metrics["surface_forecast_baseline_tree_trained_assets"] = int(tree_meta.get("trained_assets", 0))
@@ -864,19 +959,37 @@ def evaluate(
         metrics["surface_forecast_iv_rmse_baseline_parametric"] = float("nan")
         metrics["surface_forecast_iv_mae_baseline_parametric"] = float("nan")
 
+        metrics["surface_forecast_blend_family"] = blend_family
+        metrics["surface_forecast_blend_calibration_days"] = blend_val_days
+        metrics["surface_forecast_blend_shrinkage"] = float(blend_shrinkage)
+        if blend_weight_by_asset_grid.size > 0:
+            metrics["surface_forecast_blend_weight_mean"] = float(np.mean(blend_weight_by_asset_grid))
+            metrics["surface_forecast_blend_weight_std"] = float(np.std(blend_weight_by_asset_grid))
+        else:
+            metrics["surface_forecast_blend_weight_mean"] = float("nan")
+            metrics["surface_forecast_blend_weight_std"] = float("nan")
+
         mse_model = float(np.mean((pred_forecast - obs_forecast) ** 2))
         mse_base_persistence = float(np.mean((base_forecast_persistence - obs_forecast) ** 2))
         mse_base_tree = float(np.mean((base_forecast_tree - obs_forecast) ** 2))
+        mse_blend = float(np.mean((pred_forecast_blend - obs_forecast) ** 2))
+        metrics["surface_forecast_iv_rmse_model_raw"] = float(np.sqrt(mse_model))
+        metrics["surface_forecast_iv_mae_model_raw"] = mae(pred_forecast, obs_forecast)
+        metrics["surface_forecast_iv_rmse"] = float(np.sqrt(mse_blend))
+        metrics["surface_forecast_iv_mae"] = mae(pred_forecast_blend, obs_forecast)
         metrics["surface_forecast_skill_mse_vs_persistence"] = (
-            float(1.0 - (mse_model / mse_base_persistence)) if mse_base_persistence > 0 else float("nan")
+            float(1.0 - (mse_blend / mse_base_persistence)) if mse_base_persistence > 0 else float("nan")
         )
         metrics["surface_forecast_skill_mse_vs_tree"] = (
+            float(1.0 - (mse_blend / mse_base_tree)) if mse_base_tree > 0 else float("nan")
+        )
+        metrics["surface_forecast_skill_mse_vs_tree_model_raw"] = (
             float(1.0 - (mse_model / mse_base_tree)) if mse_base_tree > 0 else float("nan")
         )
         metrics["surface_forecast_skill_mse_vs_parametric"] = float("nan")
         forecast_err_by_dte, forecast_err_by_moneyness, forecast_err_grid = _surface_forecast_error_profiles(
             obs_forecast=obs_forecast.astype(np.float32),
-            pred_forecast=pred_forecast.astype(np.float32),
+            pred_forecast=pred_forecast_blend.astype(np.float32),
             x_grid=x_grid.astype(np.float32),
             tenor_days=tenor_days.astype(np.int32),
             persistence_forecast=base_forecast_persistence.astype(np.float32),
