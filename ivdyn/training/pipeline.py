@@ -28,41 +28,47 @@ class TrainingConfig:
     val_frac: float = 0.15
     split_mode: str = "by_asset_time"
 
-    latent_dim: int = 8
+    latent_dim: int = 32
+    vae_hidden: tuple[int, int] = (384, 192)
+    dynamics_hidden: tuple[int, ...] = (256, 128)
+    pricing_hidden: tuple[int, int] = (256, 128)
+    execution_hidden: tuple[int, int] = (192, 96)
+    model_dropout: float = 0.08
 
     vae_epochs: int = 150
     vae_batch_size: int = 32
     vae_lr: float = 2e-3
     vae_kl_beta: float = 0.02
     kl_warmup_epochs: int = 20
-    noarb_lambda: float = 0.0
-    noarb_butterfly_lambda: float = 0.0
+    noarb_lambda: float = 0.01
+    noarb_butterfly_lambda: float = 0.005
+    recon_huber_beta: float = 0.015
 
     head_epochs: int = 150
     dyn_batch_size: int = 64
     contract_batch_size: int = 2048
     head_lr: float = 1e-3
-    rollout_steps: int = 1
+    rollout_steps: int = 3
     rollout_surface_lambda: float = 0.5
-    rollout_calendar_lambda: float = 0.0
-    rollout_butterfly_lambda: float = 0.0
-    rollout_random_horizon: bool = False
+    rollout_calendar_lambda: float = 0.03
+    rollout_butterfly_lambda: float = 0.02
+    rollout_random_horizon: bool = True
     rollout_min_steps: int = 1
-    rollout_teacher_forcing_start: float = 0.0
-    rollout_teacher_forcing_end: float = 0.0
+    rollout_teacher_forcing_start: float = 0.35
+    rollout_teacher_forcing_end: float = 0.10
     rollout_surface_huber_beta: float = 0.02
     surface_weight_liq_alpha: float = 0.0
     surface_weight_spread_alpha: float = 0.0
     surface_weight_vega_alpha: float = 0.0
     surface_weight_clip_min: float = 1.0
-    surface_weight_clip_max: float = 1.0
-    surface_focus_alpha: float = 0.0
+    surface_weight_clip_max: float = 4.0
+    surface_focus_alpha: float = 1.25
     surface_focus_x_min: float = 0.10
     surface_focus_x_scale: float = 0.03
     surface_focus_dte_scale_days: float = 21.0
     surface_focus_dte_max_days: float = 30.0
     surface_focus_neg_x_max: float = -0.20
-    surface_focus_neg_weight_ratio: float = 0.0
+    surface_focus_neg_weight_ratio: float = 0.35
     surface_focus_density_alpha: float = 0.0
     surface_focus_density_map_path: str | None = None
 
@@ -461,6 +467,21 @@ def _weighted_surface_huber_loss(
     if point_weight is not None:
         loss = loss * point_weight
     return loss.mean()
+
+
+def _surface_recon_loss(
+    pred_scaled: torch.Tensor,
+    target_scaled: torch.Tensor,
+    *,
+    point_weight: torch.Tensor | None = None,
+    beta: float = 0.015,
+) -> torch.Tensor:
+    return _weighted_surface_huber_loss(
+        pred_scaled,
+        target_scaled,
+        point_weight=point_weight,
+        beta=beta,
+    )
 
 
 def _rollout_losses_torch(
@@ -1164,6 +1185,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     rollout_calendar_lambda = max(float(cfg.rollout_calendar_lambda), 0.0)
     rollout_butterfly_lambda = max(float(cfg.rollout_butterfly_lambda), 0.0)
     rollout_surface_huber_beta = max(float(cfg.rollout_surface_huber_beta), 1e-4)
+    recon_huber_beta = max(float(cfg.recon_huber_beta), 1e-4)
     noarb_lambda = max(float(cfg.noarb_lambda), 0.0)
     noarb_butterfly_lambda = max(float(cfg.noarb_butterfly_lambda), 0.0)
     focus_alpha = max(float(cfg.surface_focus_alpha), 0.0)
@@ -1306,6 +1328,11 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
 
     model_cfg = ModelConfig(
         latent_dim=cfg.latent_dim,
+        vae_hidden=tuple(int(v) for v in cfg.vae_hidden),
+        dynamics_hidden=tuple(int(v) for v in cfg.dynamics_hidden),
+        pricing_hidden=tuple(int(v) for v in cfg.pricing_hidden),
+        execution_hidden=tuple(int(v) for v in cfg.execution_hidden),
+        dropout=float(cfg.model_dropout),
         dynamics_residual=bool(cfg.dynamics_residual),
         n_assets=int(n_assets),
         asset_embed_dim=max(int(cfg.asset_embed_dim), 0),
@@ -1338,7 +1365,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
             z = model.reparameterize(mu, logvar)
             recon = model.decode(z)
 
-            recon_loss = F.mse_loss(recon, x)
+            batch_w = surface_w_t.index_select(0, torch.as_tensor(batch, dtype=torch.long, device=device))
+            recon_loss = _surface_recon_loss(recon, x, point_weight=batch_w, beta=recon_huber_beta)
             kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
             cal = _calendar_penalty_torch(
                 recon,
@@ -1707,7 +1735,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
         z = mu if bool(cfg.joint_use_mu_deterministic) else model.reparameterize(mu, logvar)
         recon = model.decode(z)
 
-        recon_loss = F.mse_loss(recon, x)
+        recon_loss = _surface_recon_loss(recon, x, point_weight=surface_w_tr, beta=recon_huber_beta)
         kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
         cal = _calendar_penalty_torch(
             recon,
