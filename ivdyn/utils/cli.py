@@ -272,6 +272,7 @@ def _build_training_config_from_ns(ns: Any, *, seed: int, out_dir: Path):
         context_z_clip=float(getattr(ns, "context_z_clip", 5.0)),
         context_augment_from_contracts=not bool(getattr(ns, "disable_context_augment", False)),
         dynamics_residual=not bool(getattr(ns, "disable_dynamics_residual", False)),
+        dynamics_n_experts=int(getattr(ns, "dynamics_n_experts", 1)),
         asset_embed_dim=int(getattr(ns, "asset_embed_dim", 8)),
         early_stop_patience=int(getattr(ns, "early_stop_patience", 20)),
         early_stop_min_delta=float(getattr(ns, "early_stop_min_delta", 1e-4)),
@@ -531,6 +532,13 @@ def _experiment_plan_bundles() -> list[dict[str, Any]]:
                 "latent_dim": 24,
                 "vae_kl_beta": 0.03,
                 "joint_lr": 3.5e-4,
+                "dynamics_n_experts": 4,
+                "rollout_steps": 3,
+                "rollout_random_horizon": True,
+                "rollout_min_steps": 1,
+                "rollout_teacher_forcing_start": 0.45,
+                "rollout_teacher_forcing_end": 0.08,
+                "rollout_surface_lambda": 0.9,
             },
             "unsupported_suggestions": [
                 "surface_forecast_huber_beta",
@@ -1584,6 +1592,7 @@ def _build_parser() -> ArgumentParser:
         default=False,
         help="Disable residual latent dynamics (z_next = z_prev + f(...)).",
     )
+    p.add_argument("--dynamics-n-experts", type=int, default=1)
     p.add_argument("--asset-embed-dim", type=int, default=8)
     p.add_argument("--early-stop-patience", type=int, default=20)
     p.add_argument("--early-stop-min-delta", type=float, default=1e-4)
@@ -1793,6 +1802,7 @@ def _build_parser() -> ArgumentParser:
         default=False,
         help="Disable residual latent dynamics (z_next = z_prev + f(...)).",
     )
+    p.add_argument("--dynamics-n-experts", type=int, default=1)
     p.add_argument("--asset-embed-dim", type=int, default=8)
     p.add_argument("--early-stop-patience", type=int, default=20)
     p.add_argument("--early-stop-min-delta", type=float, default=1e-4)

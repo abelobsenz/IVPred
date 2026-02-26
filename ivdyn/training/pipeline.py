@@ -91,6 +91,7 @@ class TrainingConfig:
     context_z_clip: float = 5.0
     context_augment_from_contracts: bool = True
     dynamics_residual: bool = True
+    dynamics_n_experts: int = 1
     asset_embed_dim: int = 8
     early_stop_patience: int = 20
     early_stop_min_delta: float = 1e-4
@@ -1307,6 +1308,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     model_cfg = ModelConfig(
         latent_dim=cfg.latent_dim,
         dynamics_residual=bool(cfg.dynamics_residual),
+        dynamics_n_experts=max(int(cfg.dynamics_n_experts), 1),
         n_assets=int(n_assets),
         asset_embed_dim=max(int(cfg.asset_embed_dim), 0),
     )
@@ -1953,6 +1955,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
         "price_head_enabled": bool(price_head_enabled),
         "exec_head_enabled": bool(exec_head_enabled),
         "dynamics_residual_enabled": bool(cfg.dynamics_residual),
+        "dynamics_n_experts": int(max(cfg.dynamics_n_experts, 1)),
         "asset_embedding_dim": int(max(cfg.asset_embed_dim, 0)),
         "context_dim_original": int(original_context_dim),
         "context_dim_used": int(context.shape[1]),
