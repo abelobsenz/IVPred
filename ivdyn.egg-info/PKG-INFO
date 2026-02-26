@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: ivdyn
+Version: 0.1.0
+Summary: End-to-end implied-volatility dynamics modeling from Massive options data
+Author: ivdyn
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Requires-Dist: pandas>=2.1
+Requires-Dist: pyarrow>=14
+Requires-Dist: torch>=2.2
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: plotly>=5.20
+Requires-Dist: streamlit>=1.30
+Requires-Dist: altair>=5.0
+Requires-Dist: fastapi>=0.110
+Requires-Dist: uvicorn>=0.28
+Requires-Dist: requests>=2.31
+Requires-Dist: boto3>=1.34
+
+# ivdyn
+
+IV dynamics modeling pipeline with WRDS-first data ingestion, surface construction, training, and evaluation.
+

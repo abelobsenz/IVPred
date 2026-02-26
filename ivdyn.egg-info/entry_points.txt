@@ -1,0 +1,2 @@
+[console_scripts]
+ivdyn = ivdyn.utils.cli:main

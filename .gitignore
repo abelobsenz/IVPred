@@ -1,0 +1,8 @@
+/outputs/
+/.venv/
+/Options_chain.csv
+# macOS metadata
+.DS_Store/Options_chain.csv
+/outputs/
+/.venv/
+.DS_Store
