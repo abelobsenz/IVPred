@@ -27,6 +27,7 @@ class ModelConfig:
     execution_hidden: tuple[int, int] = (128, 64)
     dropout: float = 0.05
     dynamics_residual: bool = False
+    dynamics_n_experts: int = 1
     n_assets: int = 1
     asset_embed_dim: int = 8
 
@@ -82,9 +83,18 @@ class IVDynamicsTorchModel(nn.Module):
         self.dynamics = FeedForward(
             in_dim=config.latent_dim + self.context_dim + self.asset_embed_dim,
             hidden=config.dynamics_hidden,
-            out_dim=config.latent_dim,
+            out_dim=config.latent_dim * max(int(config.dynamics_n_experts), 1),
             dropout=config.dropout,
         )
+        self.dynamics_n_experts = max(int(config.dynamics_n_experts), 1)
+        self.dynamics_gate: FeedForward | None = None
+        if self.dynamics_n_experts > 1:
+            self.dynamics_gate = FeedForward(
+                in_dim=self.context_dim + self.asset_embed_dim,
+                hidden=(max(32, self.context_dim),),
+                out_dim=self.dynamics_n_experts,
+                dropout=config.dropout,
+            )
         self.pricer = FeedForward(
             in_dim=config.latent_dim + self.contract_dim + self.asset_embed_dim,
             hidden=config.pricing_hidden,
@@ -151,7 +161,18 @@ class IVDynamicsTorchModel(nn.Module):
         )
         if emb is not None:
             parts.append(emb)
-        delta = self.dynamics(torch.cat(parts, dim=1))
+        z_in = torch.cat(parts, dim=1)
+        delta_raw = self.dynamics(z_in)
+        if self.dynamics_n_experts > 1:
+            delta_experts = delta_raw.view(-1, self.dynamics_n_experts, self.config.latent_dim)
+            gate_parts = [context_scaled]
+            if emb is not None:
+                gate_parts.append(emb)
+            gate_logits = self.dynamics_gate(torch.cat(gate_parts, dim=1))
+            gate_w = torch.softmax(gate_logits, dim=1).unsqueeze(-1)
+            delta = torch.sum(gate_w * delta_experts, dim=1)
+        else:
+            delta = delta_raw
         if self.config.dynamics_residual:
             return z_prev + delta
         return delta
