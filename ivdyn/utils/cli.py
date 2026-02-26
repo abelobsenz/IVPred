@@ -234,6 +234,8 @@ def _build_training_config_from_ns(ns: Any, *, seed: int, out_dir: Path):
         rollout_calendar_lambda=ns.rollout_calendar_lambda,
         rollout_butterfly_lambda=ns.rollout_butterfly_lambda,
         rollout_surface_huber_beta=float(getattr(ns, "rollout_surface_huber_beta", 0.02)),
+        rollout_slope_lambda=float(getattr(ns, "rollout_slope_lambda", 0.08)),
+        rollout_curvature_lambda=float(getattr(ns, "rollout_curvature_lambda", 0.02)),
         surface_weight_liq_alpha=float(getattr(ns, "surface_weight_liq_alpha", 0.0)),
         surface_weight_spread_alpha=float(getattr(ns, "surface_weight_spread_alpha", 0.0)),
         surface_weight_vega_alpha=float(getattr(ns, "surface_weight_vega_alpha", 0.0)),
@@ -1430,6 +1432,8 @@ def _build_parser() -> ArgumentParser:
     p.add_argument("--rollout-calendar-lambda", type=float, default=0.0)
     p.add_argument("--rollout-butterfly-lambda", type=float, default=0.0)
     p.add_argument("--rollout-surface-huber-beta", type=float, default=0.02)
+    p.add_argument("--rollout-slope-lambda", type=float, default=0.08)
+    p.add_argument("--rollout-curvature-lambda", type=float, default=0.02)
     p.add_argument("--surface-weight-liq-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-spread-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-vega-alpha", type=float, default=0.0)
@@ -1705,6 +1709,8 @@ def _build_parser() -> ArgumentParser:
     p.add_argument("--rollout-calendar-lambda", type=float, default=0.0)
     p.add_argument("--rollout-butterfly-lambda", type=float, default=0.0)
     p.add_argument("--rollout-surface-huber-beta", type=float, default=0.02)
+    p.add_argument("--rollout-slope-lambda", type=float, default=0.08)
+    p.add_argument("--rollout-curvature-lambda", type=float, default=0.02)
     p.add_argument("--surface-weight-liq-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-spread-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-vega-alpha", type=float, default=0.0)
