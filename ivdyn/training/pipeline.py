@@ -51,6 +51,8 @@ class TrainingConfig:
     rollout_teacher_forcing_start: float = 0.0
     rollout_teacher_forcing_end: float = 0.0
     rollout_surface_huber_beta: float = 0.02
+    rollout_slope_lambda: float = 0.08
+    rollout_curvature_lambda: float = 0.02
     surface_weight_liq_alpha: float = 0.0
     surface_weight_spread_alpha: float = 0.0
     surface_weight_vega_alpha: float = 0.0
@@ -480,6 +482,8 @@ def _rollout_losses_torch(
     surface_variable: str,
     surface_point_weight: torch.Tensor | None = None,
     rollout_surface_huber_beta: float = 0.02,
+    rollout_slope_lambda: float = 0.0,
+    rollout_curvature_lambda: float = 0.0,
     teacher_forcing_prob: float = 0.0,
     asset_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -527,6 +531,30 @@ def _rollout_losses_torch(
             )
         )
 
+        slope_lambda = max(float(rollout_slope_lambda), 0.0)
+        curvature_lambda = max(float(rollout_curvature_lambda), 0.0)
+        if slope_lambda > 0.0 or curvature_lambda > 0.0:
+            surf_pred_raw = _recon_raw_from_scaled(surf_pred, surface_scaler, nx, nt)
+            surf_true_raw = _recon_raw_from_scaled(surf_true, surface_scaler, nx, nt)
+            iv_pred = _surface_to_iv_torch(surf_pred_raw, tenor_days=tenor_days, surface_variable=surface_variable)
+            iv_true = _surface_to_iv_torch(surf_true_raw, tenor_days=tenor_days, surface_variable=surface_variable)
+
+            geom_loss = torch.tensor(0.0, dtype=iv_pred.dtype, device=iv_pred.device)
+            if slope_lambda > 0.0:
+                dx_pred = iv_pred[:, 1:, :] - iv_pred[:, :-1, :]
+                dx_true = iv_true[:, 1:, :] - iv_true[:, :-1, :]
+                dt_pred = iv_pred[:, :, 1:] - iv_pred[:, :, :-1]
+                dt_true = iv_true[:, :, 1:] - iv_true[:, :, :-1]
+                geom_loss = geom_loss + slope_lambda * (
+                    F.smooth_l1_loss(dx_pred, dx_true, beta=0.01) + F.smooth_l1_loss(dt_pred, dt_true, beta=0.01)
+                )
+
+            if curvature_lambda > 0.0 and nx >= 3:
+                dxx_pred = iv_pred[:, 2:, :] - 2.0 * iv_pred[:, 1:-1, :] + iv_pred[:, :-2, :]
+                dxx_true = iv_true[:, 2:, :] - 2.0 * iv_true[:, 1:-1, :] + iv_true[:, :-2, :]
+                geom_loss = geom_loss + curvature_lambda * F.smooth_l1_loss(dxx_pred, dxx_true, beta=0.01)
+
+            surf_losses[-1] = surf_losses[-1] + geom_loss
         surf_pred_raw = _recon_raw_from_scaled(surf_pred, surface_scaler, nx, nt)
         cal_losses.append(
             _calendar_penalty_from_raw(
@@ -1164,6 +1192,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     rollout_calendar_lambda = max(float(cfg.rollout_calendar_lambda), 0.0)
     rollout_butterfly_lambda = max(float(cfg.rollout_butterfly_lambda), 0.0)
     rollout_surface_huber_beta = max(float(cfg.rollout_surface_huber_beta), 1e-4)
+    rollout_slope_lambda = max(float(cfg.rollout_slope_lambda), 0.0)
+    rollout_curvature_lambda = max(float(cfg.rollout_curvature_lambda), 0.0)
     noarb_lambda = max(float(cfg.noarb_lambda), 0.0)
     noarb_butterfly_lambda = max(float(cfg.noarb_butterfly_lambda), 0.0)
     focus_alpha = max(float(cfg.surface_focus_alpha), 0.0)
@@ -1481,6 +1511,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
                 surface_variable=surface_variable,
                 surface_point_weight=surface_w_t,
                 rollout_surface_huber_beta=rollout_surface_huber_beta,
+                rollout_slope_lambda=rollout_slope_lambda,
+                rollout_curvature_lambda=rollout_curvature_lambda,
                 teacher_forcing_prob=head_teacher_forcing_prob,
                 asset_ids=asset_ids_t,
             )
@@ -1569,6 +1601,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
                     surface_variable=surface_variable,
                     surface_point_weight=surface_w_t,
                     rollout_surface_huber_beta=rollout_surface_huber_beta,
+                    rollout_slope_lambda=rollout_slope_lambda,
+                    rollout_curvature_lambda=rollout_curvature_lambda,
                     asset_ids=asset_ids_t,
                 )
                 val_roll_surface = float(vr_surf.item())
@@ -1749,6 +1783,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
                 surface_variable=surface_variable,
                 surface_point_weight=surface_w_tr,
                 rollout_surface_huber_beta=rollout_surface_huber_beta,
+                rollout_slope_lambda=rollout_slope_lambda,
+                rollout_curvature_lambda=rollout_curvature_lambda,
                 teacher_forcing_prob=joint_teacher_forcing_prob,
                 asset_ids=tr_asset_ids_t,
             )
@@ -1838,6 +1874,8 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
                     surface_variable=surface_variable,
                     surface_point_weight=surface_w_t,
                     rollout_surface_huber_beta=rollout_surface_huber_beta,
+                    rollout_slope_lambda=rollout_slope_lambda,
+                    rollout_curvature_lambda=rollout_curvature_lambda,
                     asset_ids=asset_ids_t,
                 )
                 val_roll_surface = float(vr_surf.item())
