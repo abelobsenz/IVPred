@@ -1,0 +1,69 @@
+{
+  "snapshot_utc": "2026-02-26T04:59:24Z",
+  "source_experiment_root": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8",
+  "symbols": {
+    "JPM": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_JPM/run_20260226_022115",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/JPM/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/JPM/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/JPM/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/JPM/dataset_meta.json"
+      }
+    },
+    "NVDA": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_NVDA/run_20260226_022103",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/NVDA/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/NVDA/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/NVDA/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/NVDA/dataset_meta.json"
+      }
+    },
+    "QQQ": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_QQQ/run_20260226_022208",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/QQQ/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/QQQ/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/QQQ/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/QQQ/dataset_meta.json"
+      }
+    },
+    "SPY": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_SPY/run_20260226_021807",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/SPY/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/SPY/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/SPY/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/SPY/dataset_meta.json"
+      }
+    },
+    "TLT": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_TLT/run_20260226_022506",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/TLT/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/TLT/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/TLT/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/TLT/dataset_meta.json"
+      }
+    },
+    "USO": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_USO/run_20260226_022428",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/USO/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/USO/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/USO/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/USO/dataset_meta.json"
+      }
+    },
+    "XLE": {
+      "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_XLE/run_20260226_041435",
+      "files": {
+        "metrics": "reports/latest_runs_snapshot/XLE/metrics.json",
+        "train_summary": "reports/latest_runs_snapshot/XLE/train_summary.json",
+        "train_config": "reports/latest_runs_snapshot/XLE/train_config.json",
+        "dataset_meta": "reports/latest_runs_snapshot/XLE/dataset_meta.json"
+      }
+    }
+  }
+}

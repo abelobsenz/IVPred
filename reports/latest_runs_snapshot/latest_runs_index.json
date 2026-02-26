@@ -1,0 +1,93 @@
+[
+  {
+    "symbol": "JPM",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_JPM/run_20260226_022115",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.09973819562906651,
+    "surface_forecast_skill_mse_vs_tree": -0.0843461068938649,
+    "surface_forecast_skill_mse_vs_persistence": 0.28125346335087575,
+    "surface_recon_iv_rmse": 0.04399797293522795,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 127421,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_JPM/dataset.npz"
+  },
+  {
+    "symbol": "NVDA",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_NVDA/run_20260226_022103",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.06442466501123721,
+    "surface_forecast_skill_mse_vs_tree": -0.06609481895326508,
+    "surface_forecast_skill_mse_vs_persistence": 0.19595566160827438,
+    "surface_recon_iv_rmse": 0.02891820077773667,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 226800,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_NVDA/dataset.npz"
+  },
+  {
+    "symbol": "QQQ",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_QQQ/run_20260226_022208",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.08589906286313989,
+    "surface_forecast_skill_mse_vs_tree": -0.22254105560613846,
+    "surface_forecast_skill_mse_vs_persistence": 0.31071640479546203,
+    "surface_recon_iv_rmse": 0.030171132742623348,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 226800,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_QQQ/dataset.npz"
+  },
+  {
+    "symbol": "SPY",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_SPY/run_20260226_021807",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.0851593978963726,
+    "surface_forecast_skill_mse_vs_tree": -0.02805397987475078,
+    "surface_forecast_skill_mse_vs_persistence": 0.26631325166798636,
+    "surface_recon_iv_rmse": 0.03541815456767553,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 226800,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_SPY/dataset.npz"
+  },
+  {
+    "symbol": "TLT",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_TLT/run_20260226_022506",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.1002646959235501,
+    "surface_forecast_skill_mse_vs_tree": -0.06914574506808235,
+    "surface_forecast_skill_mse_vs_persistence": 0.2640180459285081,
+    "surface_recon_iv_rmse": 0.0338593448919118,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 225879,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_TLT/dataset.npz"
+  },
+  {
+    "symbol": "USO",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_USO/run_20260226_022428",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.09913373972993705,
+    "surface_forecast_skill_mse_vs_tree": -0.10688582011404524,
+    "surface_forecast_skill_mse_vs_persistence": 0.12493733823520758,
+    "surface_recon_iv_rmse": 0.06039634255434257,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 136501,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_USO/dataset.npz"
+  },
+  {
+    "symbol": "XLE",
+    "run_dir": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/03_runs_XLE/run_20260226_041435",
+    "error_metric_mode": "absolute",
+    "surface_forecast_iv_rmse": 0.08049824874514552,
+    "surface_forecast_skill_mse_vs_tree": 0.0464027017212838,
+    "surface_forecast_skill_mse_vs_persistence": 0.23877582725721658,
+    "surface_recon_iv_rmse": 0.048331149550883905,
+    "surface_forecast_days": 188,
+    "n_dates_test": 189,
+    "n_contracts_test": 164938,
+    "dataset_path": "/Users/abelobsenz/FinProj_V2/outputs/wrds_run_20260225_151956_full_7sym_ld8/02_dataset_XLE/dataset.npz"
+  }
+]
