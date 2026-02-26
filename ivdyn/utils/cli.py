@@ -214,6 +214,11 @@ def _build_training_config_from_ns(ns: Any, *, seed: int, out_dir: Path):
         val_frac=ns.val_frac,
         split_mode=str(getattr(ns, "split_mode", "by_asset_time")),
         latent_dim=ns.latent_dim,
+        vae_hidden=(ns.vae_hidden_dim_1, ns.vae_hidden_dim_2),
+        dynamics_hidden=(ns.dynamics_hidden_dim_1, ns.dynamics_hidden_dim_2),
+        pricing_hidden=(ns.pricing_hidden_dim_1, ns.pricing_hidden_dim_2),
+        execution_hidden=(ns.execution_hidden_dim_1, ns.execution_hidden_dim_2),
+        model_dropout=float(getattr(ns, "model_dropout", 0.08)),
         vae_epochs=ns.vae_epochs,
         vae_batch_size=ns.vae_batch_size,
         vae_lr=ns.vae_lr,
@@ -221,6 +226,7 @@ def _build_training_config_from_ns(ns: Any, *, seed: int, out_dir: Path):
         kl_warmup_epochs=ns.kl_warmup_epochs,
         noarb_lambda=ns.noarb_lambda,
         noarb_butterfly_lambda=ns.noarb_butterfly_lambda,
+        recon_huber_beta=float(getattr(ns, "recon_huber_beta", 0.015)),
         head_epochs=ns.head_epochs,
         dyn_batch_size=ns.dyn_batch_size,
         contract_batch_size=ns.contract_batch_size,
@@ -1389,23 +1395,32 @@ def _build_parser() -> ArgumentParser:
         default="by_asset_time",
         help="Date split mode: by_asset_time uses per-asset chronology, global_time uses shared calendar chronology.",
     )
-    p.add_argument("--latent-dim", type=int, default=24)
+    p.add_argument("--latent-dim", type=int, default=32)
+    p.add_argument("--vae-hidden-dim-1", type=int, default=384)
+    p.add_argument("--vae-hidden-dim-2", type=int, default=192)
+    p.add_argument("--dynamics-hidden-dim-1", type=int, default=256)
+    p.add_argument("--dynamics-hidden-dim-2", type=int, default=128)
+    p.add_argument("--pricing-hidden-dim-1", type=int, default=256)
+    p.add_argument("--pricing-hidden-dim-2", type=int, default=128)
+    p.add_argument("--execution-hidden-dim-1", type=int, default=192)
+    p.add_argument("--execution-hidden-dim-2", type=int, default=96)
+    p.add_argument("--model-dropout", type=float, default=0.08)
     p.add_argument("--vae-epochs", type=int, default=120)
     p.add_argument("--vae-batch-size", type=int, default=32)
     p.add_argument("--vae-lr", type=float, default=2e-3)
     p.add_argument("--vae-kl-beta", type=float, default=0.02)
     p.add_argument("--kl-warmup-epochs", type=int, default=20)
-    p.add_argument("--noarb-lambda", type=float, default=0.0)
-    p.add_argument("--noarb-butterfly-lambda", type=float, default=0.0)
+    p.add_argument("--noarb-lambda", type=float, default=0.01)
+    p.add_argument("--noarb-butterfly-lambda", type=float, default=0.005)
     p.add_argument("--head-epochs", type=int, default=130)
     p.add_argument("--dyn-batch-size", type=int, default=64)
     p.add_argument("--contract-batch-size", type=int, default=2048)
     p.add_argument("--head-lr", type=float, default=1e-3)
-    p.add_argument("--rollout-steps", type=int, default=1)
+    p.add_argument("--rollout-steps", type=int, default=3)
     p.add_argument(
         "--rollout-random-horizon",
         action="store_true",
-        default=False,
+        default=True,
         help="Sample rollout horizon uniformly from [rollout_min_steps, rollout_steps] each train batch/epoch.",
     )
     p.add_argument(
@@ -1417,28 +1432,29 @@ def _build_parser() -> ArgumentParser:
     p.add_argument(
         "--rollout-teacher-forcing-start",
         type=float,
-        default=0.0,
+        default=0.35,
         help="Teacher-forcing probability at epoch 1 for rollout dynamics training.",
     )
     p.add_argument(
         "--rollout-teacher-forcing-end",
         type=float,
-        default=0.0,
+        default=0.10,
         help="Teacher-forcing probability at final epoch for rollout dynamics training.",
     )
-    p.add_argument("--rollout-surface-lambda", type=float, default=0.5)
-    p.add_argument("--rollout-calendar-lambda", type=float, default=0.0)
-    p.add_argument("--rollout-butterfly-lambda", type=float, default=0.0)
-    p.add_argument("--rollout-surface-huber-beta", type=float, default=0.02)
+    p.add_argument("--rollout-surface-lambda", type=float, default=0.65)
+    p.add_argument("--rollout-calendar-lambda", type=float, default=0.03)
+    p.add_argument("--rollout-butterfly-lambda", type=float, default=0.02)
+    p.add_argument("--rollout-surface-huber-beta", type=float, default=0.015)
+    p.add_argument("--recon-huber-beta", type=float, default=0.015)
     p.add_argument("--surface-weight-liq-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-spread-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-vega-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-clip-min", type=float, default=1.0)
-    p.add_argument("--surface-weight-clip-max", type=float, default=1.0)
+    p.add_argument("--surface-weight-clip-max", type=float, default=4.0)
     p.add_argument(
         "--surface-focus-alpha",
         type=float,
-        default=0.0,
+        default=1.25,
         help="Extra weighting strength for high positive moneyness + low DTE region (0 disables).",
     )
     p.add_argument(
@@ -1474,7 +1490,7 @@ def _build_parser() -> ArgumentParser:
     p.add_argument(
         "--surface-focus-neg-weight-ratio",
         type=float,
-        default=0.0,
+        default=0.35,
         help="Relative strength of negative-moneyness focus wing vs primary positive wing.",
     )
     p.add_argument(
@@ -1688,35 +1704,49 @@ def _build_parser() -> ArgumentParser:
         default="by_asset_time",
         help="Date split mode: by_asset_time uses per-asset chronology, global_time uses shared calendar chronology.",
     )
-    p.add_argument("--latent-dim", type=int, default=24)
+    p.add_argument("--latent-dim", type=int, default=32)
+    p.add_argument("--vae-hidden-dim-1", type=int, default=384)
+    p.add_argument("--vae-hidden-dim-2", type=int, default=192)
+    p.add_argument("--dynamics-hidden-dim-1", type=int, default=256)
+    p.add_argument("--dynamics-hidden-dim-2", type=int, default=128)
+    p.add_argument("--pricing-hidden-dim-1", type=int, default=256)
+    p.add_argument("--pricing-hidden-dim-2", type=int, default=128)
+    p.add_argument("--execution-hidden-dim-1", type=int, default=192)
+    p.add_argument("--execution-hidden-dim-2", type=int, default=96)
+    p.add_argument("--model-dropout", type=float, default=0.08)
     p.add_argument("--vae-epochs", type=int, default=120)
     p.add_argument("--vae-batch-size", type=int, default=32)
     p.add_argument("--vae-lr", type=float, default=2e-3)
     p.add_argument("--vae-kl-beta", type=float, default=0.02)
     p.add_argument("--kl-warmup-epochs", type=int, default=20)
-    p.add_argument("--noarb-lambda", type=float, default=0.0)
-    p.add_argument("--noarb-butterfly-lambda", type=float, default=0.0)
+    p.add_argument("--noarb-lambda", type=float, default=0.01)
+    p.add_argument("--noarb-butterfly-lambda", type=float, default=0.005)
     p.add_argument("--head-epochs", type=int, default=130)
     p.add_argument("--dyn-batch-size", type=int, default=64)
     p.add_argument("--contract-batch-size", type=int, default=2048)
     p.add_argument("--head-lr", type=float, default=1e-3)
-    p.add_argument("--rollout-steps", type=int, default=1)
-    p.add_argument("--rollout-surface-lambda", type=float, default=0.5)
-    p.add_argument("--rollout-calendar-lambda", type=float, default=0.0)
-    p.add_argument("--rollout-butterfly-lambda", type=float, default=0.0)
-    p.add_argument("--rollout-surface-huber-beta", type=float, default=0.02)
+    p.add_argument("--rollout-steps", type=int, default=3)
+    p.add_argument("--rollout-random-horizon", action="store_true", default=True)
+    p.add_argument("--rollout-min-steps", type=int, default=1)
+    p.add_argument("--rollout-teacher-forcing-start", type=float, default=0.35)
+    p.add_argument("--rollout-teacher-forcing-end", type=float, default=0.10)
+    p.add_argument("--rollout-surface-lambda", type=float, default=0.65)
+    p.add_argument("--rollout-calendar-lambda", type=float, default=0.03)
+    p.add_argument("--rollout-butterfly-lambda", type=float, default=0.02)
+    p.add_argument("--rollout-surface-huber-beta", type=float, default=0.015)
+    p.add_argument("--recon-huber-beta", type=float, default=0.015)
     p.add_argument("--surface-weight-liq-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-spread-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-vega-alpha", type=float, default=0.0)
     p.add_argument("--surface-weight-clip-min", type=float, default=1.0)
-    p.add_argument("--surface-weight-clip-max", type=float, default=1.0)
-    p.add_argument("--surface-focus-alpha", type=float, default=0.0)
+    p.add_argument("--surface-weight-clip-max", type=float, default=4.0)
+    p.add_argument("--surface-focus-alpha", type=float, default=1.25)
     p.add_argument("--surface-focus-x-min", type=float, default=0.10)
     p.add_argument("--surface-focus-x-scale", type=float, default=0.03)
     p.add_argument("--surface-focus-dte-scale-days", type=float, default=21.0)
     p.add_argument("--surface-focus-dte-max-days", type=float, default=30.0)
     p.add_argument("--surface-focus-neg-x-max", type=float, default=-0.20)
-    p.add_argument("--surface-focus-neg-weight-ratio", type=float, default=0.0)
+    p.add_argument("--surface-focus-neg-weight-ratio", type=float, default=0.35)
     p.add_argument("--joint-epochs", type=int, default=120)
     p.add_argument("--joint-lr", type=float, default=5e-4)
     p.add_argument("--joint-contract-batch-size", type=int, default=4096)
