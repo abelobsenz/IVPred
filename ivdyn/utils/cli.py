@@ -293,22 +293,6 @@ def _build_training_config_from_ns(ns: Any, *, seed: int, out_dir: Path):
         lr_plateau_factor=float(getattr(ns, "lr_plateau_factor", 0.5)),
         min_lr=float(getattr(ns, "min_lr", 1e-6)),
         max_cpu_threads=int(getattr(ns, "max_cpu_threads", 2)),
-        model_arch=str(getattr(ns, "model_arch", "tree_boost")),
-        option_a_seq_len=int(getattr(ns, "option_a_seq_len", 20)),
-        option_a_epochs=int(getattr(ns, "option_a_epochs", 80)),
-        option_a_batch_size=int(getattr(ns, "option_a_batch_size", 128)),
-        option_a_eval_batch_size=int(getattr(ns, "option_a_eval_batch_size", 512)),
-        option_a_lr=float(getattr(ns, "option_a_lr", 8e-4)),
-        option_a_weight_decay=float(getattr(ns, "option_a_weight_decay", 1e-5)),
-        option_a_hidden_dim=int(getattr(ns, "option_a_hidden_dim", 192)),
-        option_a_tcn_layers=int(getattr(ns, "option_a_tcn_layers", 4)),
-        option_a_tcn_kernel_size=int(getattr(ns, "option_a_tcn_kernel_size", 3)),
-        option_a_dropout=float(getattr(ns, "option_a_dropout", 0.08)),
-        option_a_early_stop_patience=int(getattr(ns, "option_a_early_stop_patience", 12)),
-        option_a_blend_alpha_min=float(getattr(ns, "option_a_blend_alpha_min", 0.6)),
-        option_a_blend_alpha_max=float(getattr(ns, "option_a_blend_alpha_max", 1.4)),
-        option_a_blend_alpha_steps=int(getattr(ns, "option_a_blend_alpha_steps", 9)),
-        option_a_device=str(getattr(ns, "option_a_device", "auto")),
     )
     # Keep CLI backward/forward compatible with the installed training pipeline.
     # Some branches expose a smaller/larger TrainingConfig field set.
@@ -1672,29 +1656,8 @@ def _build_parser() -> ArgumentParser:
         "--max-cpu-threads",
         type=int,
         default=2,
-        help="Cap CPU threads used by training.",
+        help="Cap CPU threads used by tree-based training.",
     )
-    p.add_argument(
-        "--model-arch",
-        choices=["tree_boost", "option_a_pca_tcn"],
-        default="tree_boost",
-        help="Training architecture. `tree_boost` keeps current baseline; `option_a_pca_tcn` uses shared neural factor dynamics.",
-    )
-    p.add_argument("--option-a-seq-len", type=int, default=20, help="History length L for Option-A sequence model.")
-    p.add_argument("--option-a-epochs", type=int, default=80)
-    p.add_argument("--option-a-batch-size", type=int, default=128)
-    p.add_argument("--option-a-eval-batch-size", type=int, default=512)
-    p.add_argument("--option-a-lr", type=float, default=8e-4)
-    p.add_argument("--option-a-weight-decay", type=float, default=1e-5)
-    p.add_argument("--option-a-hidden-dim", type=int, default=192)
-    p.add_argument("--option-a-tcn-layers", type=int, default=4)
-    p.add_argument("--option-a-tcn-kernel-size", type=int, default=3)
-    p.add_argument("--option-a-dropout", type=float, default=0.08)
-    p.add_argument("--option-a-early-stop-patience", type=int, default=12)
-    p.add_argument("--option-a-blend-alpha-min", type=float, default=0.6)
-    p.add_argument("--option-a-blend-alpha-max", type=float, default=1.4)
-    p.add_argument("--option-a-blend-alpha-steps", type=int, default=9)
-    p.add_argument("--option-a-device", default="auto")
     p.set_defaults(func=_train_command)
 
     p = sub.add_parser("build-dataset", help="Legacy Massive-based dataset builder.")
@@ -1950,29 +1913,8 @@ def _build_parser() -> ArgumentParser:
         "--max-cpu-threads",
         type=int,
         default=2,
-        help="Cap CPU threads used by training.",
+        help="Cap CPU threads used by tree-based training.",
     )
-    p.add_argument(
-        "--model-arch",
-        choices=["tree_boost", "option_a_pca_tcn"],
-        default="tree_boost",
-        help="Architecture used for each experiment-plan run.",
-    )
-    p.add_argument("--option-a-seq-len", type=int, default=20)
-    p.add_argument("--option-a-epochs", type=int, default=80)
-    p.add_argument("--option-a-batch-size", type=int, default=128)
-    p.add_argument("--option-a-eval-batch-size", type=int, default=512)
-    p.add_argument("--option-a-lr", type=float, default=8e-4)
-    p.add_argument("--option-a-weight-decay", type=float, default=1e-5)
-    p.add_argument("--option-a-hidden-dim", type=int, default=192)
-    p.add_argument("--option-a-tcn-layers", type=int, default=4)
-    p.add_argument("--option-a-tcn-kernel-size", type=int, default=3)
-    p.add_argument("--option-a-dropout", type=float, default=0.08)
-    p.add_argument("--option-a-early-stop-patience", type=int, default=12)
-    p.add_argument("--option-a-blend-alpha-min", type=float, default=0.6)
-    p.add_argument("--option-a-blend-alpha-max", type=float, default=1.4)
-    p.add_argument("--option-a-blend-alpha-steps", type=int, default=9)
-    p.add_argument("--option-a-device", default="auto")
     p.set_defaults(func=_experiment_plan_command)
 
     p = sub.add_parser("ui")
