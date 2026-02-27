@@ -1,7 +1,6 @@
 /outputs/
 /.venv/
 /Options_chain.csv
-/testoptionschain.csv
 
 # macOS metadata
 .DS_Store

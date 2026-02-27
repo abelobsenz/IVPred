@@ -29,6 +29,8 @@ class ModelConfig:
     dynamics_residual: bool = False
     n_assets: int = 1
     asset_embed_dim: int = 8
+    surface_refiner_hidden: tuple[int, int] = (256, 128)
+    surface_refiner_enabled: bool = True
 
 
 class FeedForward(nn.Module):
@@ -97,6 +99,19 @@ class IVDynamicsTorchModel(nn.Module):
             out_dim=1,
             dropout=config.dropout,
         )
+        self.surface_refiner: FeedForward | None = None
+        self.surface_refiner_gate: nn.Linear | None = None
+        if bool(config.surface_refiner_enabled):
+            refiner_in_dim = (
+                2 * config.latent_dim + self.context_dim + self.surface_dim + self.asset_embed_dim
+            )
+            self.surface_refiner = FeedForward(
+                in_dim=refiner_in_dim,
+                hidden=config.surface_refiner_hidden,
+                out_dim=self.surface_dim,
+                dropout=config.dropout,
+            )
+            self.surface_refiner_gate = nn.Linear(refiner_in_dim, 1)
 
     def _asset_embed(
         self,
@@ -189,6 +204,31 @@ class IVDynamicsTorchModel(nn.Module):
         if emb is not None:
             parts.append(emb)
         return self.execution(torch.cat(parts, dim=1))
+
+    def forecast_surface(
+        self,
+        z_prev: torch.Tensor,
+        z_next: torch.Tensor,
+        context_scaled: torch.Tensor,
+        surface_prev_scaled: torch.Tensor,
+        asset_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        base = self.decode(z_next)
+        if self.surface_refiner is None or self.surface_refiner_gate is None:
+            return base
+        parts = [z_prev, z_next, context_scaled, surface_prev_scaled]
+        emb = self._asset_embed(
+            asset_id,
+            batch_size=z_next.shape[0],
+            device=z_next.device,
+            dtype=z_next.dtype,
+        )
+        if emb is not None:
+            parts.append(emb)
+        refiner_input = torch.cat(parts, dim=1)
+        delta = self.surface_refiner(refiner_input)
+        gate = torch.sigmoid(self.surface_refiner_gate(refiner_input))
+        return base + gate * delta
 
 
 @dataclass(slots=True)

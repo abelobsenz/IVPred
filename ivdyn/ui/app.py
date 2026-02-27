@@ -15,6 +15,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from ivdyn.surface.arb import butterfly_violations, calendar_violations
+
 OPENAI_MODEL = "gpt-5"
 RUN_REPORTS_KEY = "_te_run_reports"
 ACTIVE_RUN_KEY = "_te_active_run_dir"
@@ -439,6 +441,63 @@ def _to_float(v: Any) -> float | None:
     return x
 
 
+def _with_tree_noarb_fallback(metrics: dict[str, Any], run_dir: Path | None = None) -> dict[str, Any]:
+    if not metrics:
+        return metrics
+
+    cal_tree = _to_float(metrics.get("calendar_violation_forecast_tree_mean"))
+    bfly_tree = _to_float(metrics.get("butterfly_violation_forecast_tree_mean"))
+    if cal_tree is not None and bfly_tree is not None:
+        return metrics
+    if run_dir is None:
+        return metrics
+
+    surf_path = run_dir / "evaluation" / "surface_predictions.npz"
+    if not surf_path.exists():
+        return metrics
+
+    try:
+        payload = np.load(surf_path, allow_pickle=False)
+    except Exception:
+        return metrics
+
+    required = {"iv_surface_obs", "iv_surface_forecast_baseline_tree", "forecast_target_index", "x_grid", "tenor_days"}
+    if not required.issubset(set(payload.files)):
+        return metrics
+
+    try:
+        iv_obs = np.asarray(payload["iv_surface_obs"], dtype=np.float32)
+        iv_tree = np.asarray(payload["iv_surface_forecast_baseline_tree"], dtype=np.float32)
+        target_idx = np.asarray(payload["forecast_target_index"], dtype=np.int64).reshape(-1)
+        x_grid = np.asarray(payload["x_grid"], dtype=np.float32).reshape(-1)
+        tenor_days = np.asarray(payload["tenor_days"], dtype=np.int32).reshape(-1)
+    except Exception:
+        return metrics
+
+    if iv_obs.ndim != 3 or iv_tree.ndim != 3:
+        return metrics
+    if len(iv_tree) == 0 or len(target_idx) == 0:
+        return metrics
+    if len(iv_tree) != len(target_idx):
+        return metrics
+
+    valid = (target_idx >= 0) & (target_idx < len(iv_obs))
+    if not np.any(valid):
+        return metrics
+    iv_tree_valid = iv_tree[valid]
+    if len(iv_tree_valid) == 0:
+        return metrics
+
+    out = dict(metrics)
+    if cal_tree is None:
+        cal_tree_vals = calendar_violations(iv_tree_valid, tenor_days)
+        out["calendar_violation_forecast_tree_mean"] = float(np.mean(cal_tree_vals)) if len(cal_tree_vals) else float("nan")
+    if bfly_tree is None:
+        bfly_tree_vals = butterfly_violations(iv_tree_valid, x_grid, tenor_days)
+        out["butterfly_violation_forecast_tree_mean"] = float(np.mean(bfly_tree_vals)) if len(bfly_tree_vals) else float("nan")
+    return out
+
+
 def _edge_vs_baseline(model_value: float | None, baseline_value: float | None, *, better: str) -> tuple[float | None, float | None]:
     if model_value is None or baseline_value is None:
         return None, None
@@ -584,27 +643,78 @@ def _build_direct_baseline_value_df(metrics: dict[str, Any]) -> pd.DataFrame:
 
 def _build_noarb_alignment_df(metrics: dict[str, Any]) -> pd.DataFrame:
     specs = [
-        ("Calendar violations (recon)", "calendar_violation_obs_mean", "calendar_violation_pred_mean"),
-        ("Butterfly violations (recon)", "butterfly_violation_obs_mean", "butterfly_violation_pred_mean"),
-        ("Calendar violations (forecast)", "calendar_violation_forecast_obs_mean", "calendar_violation_forecast_pred_mean"),
-        ("Butterfly violations (forecast)", "butterfly_violation_forecast_obs_mean", "butterfly_violation_forecast_pred_mean"),
+        {
+            "label": "Calendar violations (recon)",
+            "obs_key": "calendar_violation_obs_mean",
+            "model_key": "calendar_violation_pred_mean",
+            "tree_key": None,
+        },
+        {
+            "label": "Butterfly violations (recon)",
+            "obs_key": "butterfly_violation_obs_mean",
+            "model_key": "butterfly_violation_pred_mean",
+            "tree_key": None,
+        },
+        {
+            "label": "Calendar violations (forecast)",
+            "obs_key": "calendar_violation_forecast_obs_mean",
+            "model_key": "calendar_violation_forecast_pred_mean",
+            "tree_key": "calendar_violation_forecast_tree_mean",
+        },
+        {
+            "label": "Butterfly violations (forecast)",
+            "obs_key": "butterfly_violation_forecast_obs_mean",
+            "model_key": "butterfly_violation_forecast_pred_mean",
+            "tree_key": "butterfly_violation_forecast_tree_mean",
+        },
     ]
     rows: list[dict[str, Any]] = []
-    for label, obs_key, pred_key in specs:
-        obs = _to_float(metrics.get(obs_key))
-        pred = _to_float(metrics.get(pred_key))
-        if obs is None or pred is None:
+    for spec in specs:
+        obs = _to_float(metrics.get(str(spec["obs_key"])))
+        model = _to_float(metrics.get(str(spec["model_key"])))
+        tree = _to_float(metrics.get(str(spec["tree_key"]))) if spec.get("tree_key") else None
+        if obs is None or model is None:
             continue
+        model_tree_delta = (model - tree) if tree is not None else None
         rows.append(
             {
-                "Factor": label,
+                "Factor": str(spec["label"]),
                 "Observed": obs,
-                "Predicted": pred,
-                "Pred - Obs": pred - obs,
-                "Abs Gap": abs(pred - obs),
+                "Model": model,
+                "Tree Baseline": tree,
+                "Model - Obs": model - obs,
+                "Model Abs Gap": abs(model - obs),
+                "Model - Tree": model_tree_delta,
+                "Abs(Model - Tree)": (abs(model_tree_delta) if model_tree_delta is not None else None),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _render_noarb_alignment_section(metrics: dict[str, Any], run_dir: Path | None = None) -> None:
+    metrics_view = _with_tree_noarb_fallback(metrics, run_dir=run_dir)
+    st.subheader("No-Arb Alignment (Predicted vs Observed)")
+    noarb = _build_noarb_alignment_df(metrics_view)
+    if noarb.empty:
+        st.info("No no-arbitrage observed/predicted metrics found.")
+        return
+
+    show = noarb.copy()
+    for col in (
+        "Observed",
+        "Model",
+        "Tree Baseline",
+        "Model - Obs",
+        "Model Abs Gap",
+        "Model - Tree",
+        "Abs(Model - Tree)",
+    ):
+        if col in show.columns:
+            show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.caption(
+        "Lower violations are better. For forecast rows, negative `Model - Tree` means the model has fewer violations than tree."
+    )
 
 
 def _render_baseline_cards(metrics: dict[str, Any]) -> None:
@@ -649,7 +759,7 @@ def _render_baseline_cards(metrics: dict[str, Any]) -> None:
             st.caption(f"Baseline: {_format_value(baseline_value, 6)}")
 
 
-def _render_baseline_sections(metrics: dict[str, Any]) -> None:
+def _render_baseline_sections(metrics: dict[str, Any], run_dir: Path | None = None) -> None:
     if not metrics:
         return
     primary = _resolve_primary_non_persistence_baseline(metrics)
@@ -739,16 +849,7 @@ def _render_baseline_sections(metrics: dict[str, Any]) -> None:
     else:
         st.info("No model-vs-baseline metric pairs available in this run.")
 
-    st.subheader("No-Arb Alignment (Predicted vs Observed)")
-    noarb = _build_noarb_alignment_df(metrics)
-    if noarb.empty:
-        st.info("No no-arbitrage observed/predicted metrics found.")
-    else:
-        show = noarb.copy()
-        for col in ("Observed", "Predicted", "Pred - Obs", "Abs Gap"):
-            if col in show.columns:
-                show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+    _render_noarb_alignment_section(metrics, run_dir=run_dir)
 
 
 def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path]) -> pd.DataFrame:
@@ -757,6 +858,7 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
         metrics = _read_json(run_dir / "evaluation" / "metrics.json")
         if not metrics:
             continue
+        metrics = _with_tree_noarb_fallback(metrics, run_dir=run_dir)
 
         primary = _resolve_primary_non_persistence_baseline(metrics)
         surf_rmse = _to_float(metrics.get("surface_forecast_iv_rmse"))
@@ -767,8 +869,15 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
 
         cal_obs_f = _to_float(metrics.get("calendar_violation_forecast_obs_mean"))
         cal_pred_f = _to_float(metrics.get("calendar_violation_forecast_pred_mean"))
+        cal_tree_f = _to_float(metrics.get("calendar_violation_forecast_tree_mean"))
         bfly_obs_f = _to_float(metrics.get("butterfly_violation_forecast_obs_mean"))
         bfly_pred_f = _to_float(metrics.get("butterfly_violation_forecast_pred_mean"))
+        bfly_tree_f = _to_float(metrics.get("butterfly_violation_forecast_tree_mean"))
+
+        cal_gap_model = (abs(cal_pred_f - cal_obs_f) if cal_obs_f is not None and cal_pred_f is not None else None)
+        cal_gap_tree = (abs(cal_tree_f - cal_obs_f) if cal_obs_f is not None and cal_tree_f is not None else None)
+        bfly_gap_model = (abs(bfly_pred_f - bfly_obs_f) if bfly_obs_f is not None and bfly_pred_f is not None else None)
+        bfly_gap_tree = (abs(bfly_tree_f - bfly_obs_f) if bfly_obs_f is not None and bfly_tree_f is not None else None)
 
         rows.append(
             {
@@ -784,8 +893,16 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
                 "Surface edge (vs primary)": surf_edge_primary,
                 "Surface RMSE baseline (persistence)": surf_base_persistence,
                 "Surface edge (vs persistence)": surf_edge_persistence,
-                "Forecast calendar abs gap": (abs(cal_pred_f - cal_obs_f) if cal_obs_f is not None and cal_pred_f is not None else None),
-                "Forecast butterfly abs gap": (abs(bfly_pred_f - bfly_obs_f) if bfly_obs_f is not None and bfly_pred_f is not None else None),
+                "Forecast calendar abs gap (model)": cal_gap_model,
+                "Forecast calendar abs gap (tree)": cal_gap_tree,
+                "Forecast calendar edge vs tree (gap)": (
+                    (cal_gap_tree - cal_gap_model) if cal_gap_tree is not None and cal_gap_model is not None else None
+                ),
+                "Forecast butterfly abs gap (model)": bfly_gap_model,
+                "Forecast butterfly abs gap (tree)": bfly_gap_tree,
+                "Forecast butterfly edge vs tree (gap)": (
+                    (bfly_gap_tree - bfly_gap_model) if bfly_gap_tree is not None and bfly_gap_model is not None else None
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -802,7 +919,7 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
         st.warning("No evaluation metrics found for selected run.")
         return
 
-    _render_baseline_sections(metrics)
+    _render_baseline_sections(metrics, run_dir=run_dir)
 
     st.subheader("All Symbols: Latest Run Baseline Snapshot")
     snap = _build_all_symbols_baseline_snapshot(latest_runs_by_symbol)
@@ -844,8 +961,12 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
         "Surface edge (vs primary)",
         "Surface RMSE baseline (persistence)",
         "Surface edge (vs persistence)",
-        "Forecast calendar abs gap",
-        "Forecast butterfly abs gap",
+        "Forecast calendar abs gap (model)",
+        "Forecast calendar abs gap (tree)",
+        "Forecast calendar edge vs tree (gap)",
+        "Forecast butterfly abs gap (model)",
+        "Forecast butterfly abs gap (tree)",
+        "Forecast butterfly edge vs tree (gap)",
     ):
         if col in show.columns:
             show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
@@ -883,6 +1004,15 @@ def _extract_symbol_from_run_dir(run_dir: Path) -> str | None:
         if name == "runs":
             symbol = node.parent.name.strip().upper()
             return symbol or None
+
+    # Fallback for ad-hoc run roots (for example `outputs/retrain_qqq/run_*`).
+    # If this is a single-asset run, train_summary captures the symbol reliably.
+    summary = _read_json(resolved / "train_summary.json")
+    assets = summary.get("assets")
+    if isinstance(assets, list) and len(assets) == 1:
+        symbol = str(assets[0]).strip().upper()
+        if symbol:
+            return symbol
     return None
 
 
@@ -1530,7 +1660,7 @@ def _render_eval_diagnostics(run_dir: Path) -> None:
         c3.metric("Surface Recon RMSE", _format_value(metrics.get("surface_recon_iv_rmse"), 6))
         c4.metric("Forecast Butterfly Pred", _format_value(metrics.get("butterfly_violation_forecast_pred_mean"), 6))
 
-        _render_baseline_sections(metrics)
+        _render_baseline_sections(metrics, run_dir=run_dir)
     else:
         st.warning("No evaluation metrics found.")
 
@@ -1587,12 +1717,18 @@ def _render_run_overview(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
                 "Surface edge (vs primary)",
                 "Surface RMSE baseline (persistence)",
                 "Surface edge (vs persistence)",
-                "Forecast calendar abs gap",
-                "Forecast butterfly abs gap",
+                "Forecast calendar abs gap (model)",
+                "Forecast calendar abs gap (tree)",
+                "Forecast calendar edge vs tree (gap)",
+                "Forecast butterfly abs gap (model)",
+                "Forecast butterfly abs gap (tree)",
+                "Forecast butterfly edge vs tree (gap)",
             ):
                 if col in show.columns:
                     show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
-            st.caption("Positive surface edge means model beats that baseline; lower forecast no-arb abs gaps are better.")
+            st.caption(
+                "Positive surface edge means model beats that baseline; positive no-arb edge vs tree means model has lower abs gap than tree."
+            )
             st.dataframe(show, use_container_width=True, hide_index=True)
 
     st.subheader("Training Summary")
@@ -1747,6 +1883,8 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
             .properties(height=220)
         )
         st.altair_chart(chart_edges, use_container_width=True)
+
+    _render_noarb_alignment_section(metrics, run_dir=run_dir)
 
     st.subheader("DTE/Moneyness Absolute Error Structure")
     by_dte = _read_parquet_or_csv(eval_dir / "surface_forecast_error_by_dte.parquet")

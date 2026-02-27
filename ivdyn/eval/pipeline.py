@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ except Exception:  # pragma: no cover
 
 from ivdyn.eval.metrics import brier_score, mae, r2, rmse
 from ivdyn.model import ModelBundle, device_auto, to_numpy
+from ivdyn.model.scalers import ArrayScaler
 from ivdyn.surface import butterfly_violations, calendar_violations
 
 
@@ -173,6 +175,14 @@ def _surface_to_iv_numpy(surface_raw: np.ndarray, tenor_days: np.ndarray, surfac
     w = np.clip(surface_raw, 1e-8, None)
     iv = np.sqrt(np.clip(w / np.clip(tau, 1e-6, None), 1e-8, None))
     return iv.astype(np.float32)
+
+
+def _iv_to_surface_raw_numpy(iv_surface: np.ndarray, tenor_days: np.ndarray, surface_variable: str) -> np.ndarray:
+    if _surface_variable_name(surface_variable) != "total_variance":
+        return np.clip(iv_surface, 1e-4, 4.0).astype(np.float32)
+    tau = (tenor_days.astype(np.float32) / 365.0).reshape(1, 1, -1)
+    w = np.square(np.clip(iv_surface, 1e-4, 4.0)) * np.clip(tau, 1e-6, None)
+    return np.clip(w, 1e-8, 8.0).astype(np.float32)
 
 
 def _surface_forecast_error_profiles(
@@ -335,6 +345,76 @@ def _augment_context_with_contract_intraday(
         agg[:, j] = col
 
     return np.concatenate([context.astype(np.float32), agg.astype(np.float32)], axis=1)
+
+
+def _augment_context_with_surface_history(
+    *,
+    context: np.ndarray,
+    surface_raw: np.ndarray,
+    tenor_days: np.ndarray,
+    asset_ids: np.ndarray,
+    surface_variable: str,
+) -> np.ndarray:
+    n_dates = int(surface_raw.shape[0])
+    if n_dates <= 1:
+        return context
+
+    iv = _surface_to_iv_numpy(surface_raw.astype(np.float32), tenor_days, surface_variable).astype(np.float64)
+    nx = int(iv.shape[1])
+    nt = int(iv.shape[2])
+    if nx <= 0 or nt <= 0:
+        return context
+
+    x_idx_atm = int(nx // 2)
+    x_idx_put = max(0, int(round(0.15 * (nx - 1))))
+    x_idx_call = min(nx - 1, int(round(0.85 * (nx - 1))))
+    t_idx_short = int(np.argmin(np.abs(np.asarray(tenor_days, dtype=np.float64) - 14.0)))
+    t_idx_mid = int(np.argmin(np.abs(np.asarray(tenor_days, dtype=np.float64) - 30.0)))
+    t_idx_long = int(np.argmin(np.abs(np.asarray(tenor_days, dtype=np.float64) - 90.0)))
+
+    level = np.mean(iv, axis=(1, 2))
+    atm_short = iv[:, x_idx_atm, t_idx_short]
+    atm_mid = iv[:, x_idx_atm, t_idx_mid]
+    atm_long = iv[:, x_idx_atm, t_idx_long]
+    rr_short = iv[:, x_idx_call, t_idx_short] - iv[:, x_idx_put, t_idx_short]
+    term_slope = atm_long - atm_short
+    smile_curv = iv[:, x_idx_put, t_idx_mid] + iv[:, x_idx_call, t_idx_mid] - 2.0 * atm_mid
+
+    base = np.stack([level, atm_short, atm_mid, atm_long, rr_short, term_slope, smile_curv], axis=1)
+    lag1 = np.zeros_like(base)
+    d1 = np.zeros_like(base)
+    ewm5 = np.zeros_like(base)
+    alpha = 2.0 / (5.0 + 1.0)
+
+    aid = np.asarray(asset_ids, dtype=np.int32).reshape(-1)
+    for a in np.unique(aid):
+        idx = np.where(aid == a)[0]
+        if len(idx) == 0:
+            continue
+        seq = np.sort(idx)
+        prev = base[seq[0]].copy()
+        ema = prev.copy()
+        lag1[seq[0]] = prev
+        ewm5[seq[0]] = ema
+        d1[seq[0]] = 0.0
+        for j in range(1, len(seq)):
+            cur = base[seq[j]]
+            lag1[seq[j]] = prev
+            d1[seq[j]] = cur - prev
+            ema = alpha * prev + (1.0 - alpha) * ema
+            ewm5[seq[j]] = ema
+            prev = cur
+
+    out = np.concatenate([lag1, d1, ewm5], axis=1).astype(np.float32)
+    return np.concatenate([context.astype(np.float32), out], axis=1)
+
+
+def _load_tree_artifact(path: Path) -> dict[str, object]:
+    with path.open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Invalid tree_model.pkl payload: expected dict.")
+    return payload
 
 
 def _tree_boost_surface_nextday_forecast(
@@ -593,10 +673,8 @@ def evaluate(
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     ds = _load_dataset(dataset_path)
-
-    dev = torch.device(device) if device else device_auto()
-    bundle = ModelBundle.load(run_dir / "model.pt", device=dev)
-    model = bundle.model.to(dev).eval()
+    tree_model_path = run_dir / "tree_model.pkl"
+    tree_artifact = _load_tree_artifact(tree_model_path) if tree_model_path.exists() else None
 
     dates = ds["dates"].astype(str)
     n_dates = len(dates)
@@ -619,35 +697,12 @@ def evaluate(
 
     surface_raw_obs = ds["surface"].astype(np.float32) if "surface" in ds else ds["iv_surface"].astype(np.float32)
     iv_surface_obs = _surface_to_iv_numpy(surface_raw_obs, tenor_days, surface_variable)
-    surface_flat = surface_raw_obs.reshape(n_dates, -1)
-    surface_scaled = bundle.surface_scaler.transform(surface_flat)
 
     context = ds["context"].astype(np.float32)
     contract_features = ds["contract_features"].astype(np.float32)
     contract_feature_names = ds.get("contract_feature_names", np.array([], dtype=str)).astype(str).tolist()
     contract_date_idx = ds["contract_date_index"].astype(np.int32)
     contract_asset_id = ds.get("contract_asset_id", asset_ids[contract_date_idx]).astype(np.int32)
-    expected_context_dim = int(bundle.context_scaler.mean.shape[1])
-    if int(context.shape[1]) != expected_context_dim:
-        context_aug = _augment_context_with_contract_intraday(
-            context=context,
-            features=contract_features,
-            feature_names=contract_feature_names,
-            date_idx=contract_date_idx,
-            n_dates=n_dates,
-        )
-        if int(context_aug.shape[1]) != expected_context_dim:
-            raise RuntimeError(
-                "Context dimension mismatch for evaluation dataset and model scaler: "
-                f"dataset_context_dim={context.shape[1]}, "
-                f"augmented_context_dim={context_aug.shape[1]}, "
-                f"expected_context_dim={expected_context_dim}"
-            )
-        context = context_aug
-    context_scaled = bundle.context_scaler.transform(context)
-
-    surface_only = bool(surface_dynamics_only)
-    contract_scaled = bundle.contract_scaler.transform(contract_features)
     contract_price_target = ds["contract_price_target"].astype(np.float32)
     contract_fill_target = ds["contract_fill_target"].astype(np.float32)
     contract_symbol = ds["contract_symbol"].astype(str)
@@ -669,38 +724,147 @@ def evaluate(
         train_idx=tr_dates.astype(np.int64),
         test_idx=test_dates.astype(np.int64),
     )
-    # Use inference_mode for lower overhead than no_grad during evaluation.
-    with torch.inference_mode():
-        sf = torch.as_tensor(surface_scaled, dtype=torch.float32, device=dev)
-        mu, _ = model.encode(sf)
-        recon_scaled = model.decode(mu)
-        z_all_t = torch.as_tensor(mu, dtype=torch.float32, device=dev)
-        ctx_t = torch.as_tensor(context_scaled, dtype=torch.float32, device=dev)
-        asset_t = torch.as_tensor(asset_ids, dtype=torch.long, device=dev)
-        z_next_t = model.forward_dynamics(z_all_t, ctx_t, asset_id=asset_t)
-        forecast_scaled = model.decode(z_next_t)
+    price_pred = np.array([], dtype=np.float32)
+    price_pred_next = np.array([], dtype=np.float32)
+    exec_prob = np.array([], dtype=np.float32)
+    z_all = np.zeros((n_dates, 1), dtype=np.float32)
+    z_next = np.zeros((n_dates, 1), dtype=np.float32)
 
-        recon_raw = bundle.surface_scaler.inverse_transform(to_numpy(recon_scaled)).reshape(surface_raw_obs.shape)
-        forecast_raw = bundle.surface_scaler.inverse_transform(to_numpy(forecast_scaled)).reshape(surface_raw_obs.shape)
+    if tree_artifact is not None:
+        # Tree-native run: use cached enhanced-tree outputs as model predictions.
+        recon_raw = np.asarray(tree_artifact.get("recon_surface_raw"), dtype=np.float32)
+        forecast_raw = np.asarray(tree_artifact.get("forecast_surface_raw"), dtype=np.float32)
+
+        if recon_raw.shape != surface_raw_obs.shape:
+            recon_iv_cache = np.asarray(tree_artifact.get("recon_iv"), dtype=np.float32)
+            if recon_iv_cache.shape == iv_surface_obs.shape:
+                recon_raw = _iv_to_surface_raw_numpy(recon_iv_cache, tenor_days, surface_variable)
+            else:
+                raise RuntimeError(
+                    "Tree artifact reconstruction shape mismatch: "
+                    f"recon_raw={recon_raw.shape}, recon_iv={recon_iv_cache.shape}, obs={surface_raw_obs.shape}"
+                )
+        if forecast_raw.shape != surface_raw_obs.shape:
+            forecast_iv_cache = np.asarray(tree_artifact.get("forecast_iv"), dtype=np.float32)
+            if forecast_iv_cache.shape == iv_surface_obs.shape:
+                forecast_raw = _iv_to_surface_raw_numpy(forecast_iv_cache, tenor_days, surface_variable)
+            else:
+                raise RuntimeError(
+                    "Tree artifact forecast shape mismatch: "
+                    f"forecast_raw={forecast_raw.shape}, forecast_iv={forecast_iv_cache.shape}, obs={surface_raw_obs.shape}"
+                )
+
         recon_iv = _surface_to_iv_numpy(recon_raw.astype(np.float32), tenor_days, surface_variable)
         forecast_iv = _surface_to_iv_numpy(forecast_raw.astype(np.float32), tenor_days, surface_variable)
-        z_all = to_numpy(mu)
-        z_next = to_numpy(z_next_t)
 
-        price_pred = np.array([], dtype=np.float32)
-        price_pred_next = np.array([], dtype=np.float32)
-        exec_prob = np.array([], dtype=np.float32)
-        if not surface_only:
-            cf = torch.as_tensor(contract_scaled, dtype=torch.float32, device=dev)
-            z_contract = torch.as_tensor(z_all[contract_date_idx], dtype=torch.float32, device=dev)
-            z_contract_next = torch.as_tensor(z_next[contract_date_idx], dtype=torch.float32, device=dev)
-            contract_asset_t = torch.as_tensor(contract_asset_id, dtype=torch.long, device=dev)
-            price_scaled_pred = to_numpy(model.forward_pricer(z_contract, cf, asset_id=contract_asset_t)).reshape(-1, 1)
-            price_scaled_pred_next = to_numpy(model.forward_pricer(z_contract_next, cf, asset_id=contract_asset_t)).reshape(-1, 1)
-            exec_logit = to_numpy(model.forward_execution_logit(z_contract, cf, asset_id=contract_asset_t)).reshape(-1)
-            price_pred = bundle.price_scaler.inverse_transform(price_scaled_pred).reshape(-1)
-            price_pred_next = bundle.price_scaler.inverse_transform(price_scaled_pred_next).reshape(-1)
-            exec_prob = 1.0 / (1.0 + np.exp(-np.clip(exec_logit, -60.0, 60.0)))
+        latent_cache = np.asarray(tree_artifact.get("latent"), dtype=np.float32)
+        if latent_cache.ndim == 1:
+            latent_cache = latent_cache.reshape(-1, 1)
+        if latent_cache.ndim == 2 and latent_cache.shape[0] == n_dates:
+            z_all = latent_cache
+            z_next = latent_cache.copy()
+
+        context_aug = context.astype(np.float32)
+        if bool(tree_artifact.get("context_augment_from_contracts", False)):
+            context_aug = _augment_context_with_contract_intraday(
+                context=context_aug,
+                features=contract_features,
+                feature_names=contract_feature_names,
+                date_idx=contract_date_idx,
+                n_dates=n_dates,
+            )
+        if bool(tree_artifact.get("context_augment_surface_history", False)):
+            context_aug = _augment_context_with_surface_history(
+                context=context_aug,
+                surface_raw=surface_raw_obs,
+                tenor_days=tenor_days,
+                asset_ids=asset_ids,
+                surface_variable=surface_variable,
+            )
+
+        scaler_state = tree_artifact.get("context_scaler_state")
+        if isinstance(scaler_state, dict):
+            context_scaler = ArrayScaler.from_state(scaler_state)
+            expected_context_dim = int(context_scaler.mean.shape[1])
+            if int(context_aug.shape[1]) != expected_context_dim:
+                raise RuntimeError(
+                    "Context dimension mismatch for tree artifact scaler: "
+                    f"context_dim={context_aug.shape[1]} expected={expected_context_dim}"
+                )
+            context_scaled = context_scaler.transform(context_aug)
+        else:
+            context_scaled = context_aug.astype(np.float32)
+
+        # Tree runs are surface-only; keep contract metrics disabled.
+        surface_only = True
+    else:
+        dev = torch.device(device) if device else device_auto()
+        bundle = ModelBundle.load(run_dir / "model.pt", device=dev)
+        model = bundle.model.to(dev).eval()
+
+        surface_flat = surface_raw_obs.reshape(n_dates, -1)
+        surface_scaled = bundle.surface_scaler.transform(surface_flat)
+
+        expected_context_dim = int(bundle.context_scaler.mean.shape[1])
+        if int(context.shape[1]) != expected_context_dim:
+            context_aug = _augment_context_with_contract_intraday(
+                context=context,
+                features=contract_features,
+                feature_names=contract_feature_names,
+                date_idx=contract_date_idx,
+                n_dates=n_dates,
+            )
+            if int(context_aug.shape[1]) != expected_context_dim:
+                context_aug_2 = _augment_context_with_surface_history(
+                    context=context_aug,
+                    surface_raw=surface_raw_obs,
+                    tenor_days=tenor_days,
+                    asset_ids=asset_ids,
+                    surface_variable=surface_variable,
+                )
+            else:
+                context_aug_2 = context_aug
+            if int(context_aug_2.shape[1]) != expected_context_dim:
+                raise RuntimeError(
+                    "Context dimension mismatch for evaluation dataset and model scaler: "
+                    f"dataset_context_dim={context.shape[1]}, "
+                    f"augmented_context_dim={context_aug_2.shape[1]}, "
+                    f"expected_context_dim={expected_context_dim}"
+                )
+            context = context_aug_2
+        context_scaled = bundle.context_scaler.transform(context)
+
+        surface_only = bool(surface_dynamics_only)
+        contract_scaled = bundle.contract_scaler.transform(contract_features)
+        # Use inference_mode for lower overhead than no_grad during evaluation.
+        with torch.inference_mode():
+            sf = torch.as_tensor(surface_scaled, dtype=torch.float32, device=dev)
+            mu, _ = model.encode(sf)
+            recon_scaled = model.decode(mu)
+            z_all_t = torch.as_tensor(mu, dtype=torch.float32, device=dev)
+            ctx_t = torch.as_tensor(context_scaled, dtype=torch.float32, device=dev)
+            asset_t = torch.as_tensor(asset_ids, dtype=torch.long, device=dev)
+            z_next_t = model.forward_dynamics(z_all_t, ctx_t, asset_id=asset_t)
+            forecast_scaled = model.forecast_surface(z_all_t, z_next_t, ctx_t, sf, asset_id=asset_t)
+
+            recon_raw = bundle.surface_scaler.inverse_transform(to_numpy(recon_scaled)).reshape(surface_raw_obs.shape)
+            forecast_raw = bundle.surface_scaler.inverse_transform(to_numpy(forecast_scaled)).reshape(surface_raw_obs.shape)
+            recon_iv = _surface_to_iv_numpy(recon_raw.astype(np.float32), tenor_days, surface_variable)
+            forecast_iv = _surface_to_iv_numpy(forecast_raw.astype(np.float32), tenor_days, surface_variable)
+            z_all = to_numpy(mu)
+            z_next = to_numpy(z_next_t)
+
+            if not surface_only:
+                cf = torch.as_tensor(contract_scaled, dtype=torch.float32, device=dev)
+                z_contract = torch.as_tensor(z_all[contract_date_idx], dtype=torch.float32, device=dev)
+                z_contract_next = torch.as_tensor(z_next[contract_date_idx], dtype=torch.float32, device=dev)
+                contract_asset_t = torch.as_tensor(contract_asset_id, dtype=torch.long, device=dev)
+                price_scaled_pred = to_numpy(model.forward_pricer(z_contract, cf, asset_id=contract_asset_t)).reshape(-1, 1)
+                price_scaled_pred_next = to_numpy(model.forward_pricer(z_contract_next, cf, asset_id=contract_asset_t)).reshape(-1, 1)
+                exec_logit = to_numpy(model.forward_execution_logit(z_contract, cf, asset_id=contract_asset_t)).reshape(-1)
+                price_pred = bundle.price_scaler.inverse_transform(price_scaled_pred).reshape(-1)
+                price_pred_next = bundle.price_scaler.inverse_transform(price_scaled_pred_next).reshape(-1)
+                exec_prob = 1.0 / (1.0 + np.exp(-np.clip(exec_logit, -60.0, 60.0)))
 
     metrics: dict[str, float | int | str] = {
         "surface_dynamics_focus_mode": "surface_dynamics_only" if surface_only else "full_contract_metrics",
@@ -966,6 +1130,23 @@ def evaluate(
         metrics["calendar_violation_forecast_pred_mean"] = float(np.mean(cal_pred_f)) if len(cal_pred_f) else float("nan")
         metrics["butterfly_violation_forecast_obs_mean"] = float(np.mean(bfly_obs_f)) if len(bfly_obs_f) else float("nan")
         metrics["butterfly_violation_forecast_pred_mean"] = float(np.mean(bfly_pred_f)) if len(bfly_pred_f) else float("nan")
+
+        # Tree-baseline no-arbitrage diagnostics on the same forecast targets.
+        if len(base_forecast_tree) == len(forecast_entry_idx):
+            rows_tree_f = [
+                _noarb_for_day(obs_forecast[i], base_forecast_tree[i], x_grid, tenor_days) for i in range(len(forecast_entry_idx))
+            ]
+            cal_tree_f = np.array([r[1] for r in rows_tree_f], dtype=np.float32)
+            bfly_tree_f = np.array([r[3] for r in rows_tree_f], dtype=np.float32)
+            metrics["calendar_violation_forecast_tree_mean"] = (
+                float(np.mean(cal_tree_f)) if len(cal_tree_f) else float("nan")
+            )
+            metrics["butterfly_violation_forecast_tree_mean"] = (
+                float(np.mean(bfly_tree_f)) if len(bfly_tree_f) else float("nan")
+            )
+        else:
+            metrics["calendar_violation_forecast_tree_mean"] = float("nan")
+            metrics["butterfly_violation_forecast_tree_mean"] = float("nan")
     else:
         cal_obs_f = np.array([], dtype=np.float32)
         cal_pred_f = np.array([], dtype=np.float32)
@@ -975,6 +1156,8 @@ def evaluate(
         metrics["calendar_violation_forecast_pred_mean"] = float("nan")
         metrics["butterfly_violation_forecast_obs_mean"] = float("nan")
         metrics["butterfly_violation_forecast_pred_mean"] = float("nan")
+        metrics["calendar_violation_forecast_tree_mean"] = float("nan")
+        metrics["butterfly_violation_forecast_tree_mean"] = float("nan")
 
     metrics["num_workers"] = workers
     metrics["parallel_backend"] = parallel_backend
