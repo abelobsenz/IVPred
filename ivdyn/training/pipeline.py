@@ -13,6 +13,7 @@ import pandas as pd
 
 try:
     from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.isotonic import IsotonicRegression
 except Exception as exc:  # pragma: no cover
     raise RuntimeError(
         "scikit-learn is required for tree-based training. Install scikit-learn in the active environment."
@@ -139,6 +140,35 @@ class TrainingConfig:
     tree_tenor_calibration_shrinkage: float = 0.35
     tree_tenor_slope_min: float = 0.70
     tree_tenor_slope_max: float = 1.30
+
+    # --- Tree-v5 extensions (default-safe, feature-flagged). ---
+    # Target space for PCA + forecasting. Keeps scoring in IV space, regardless.
+    #   - "iv":             model PCA + deltas directly in IV
+    #   - "total_variance": model in w = IV^2 * tau
+    #   - "log_total_variance": model in log(w)
+    tree_target_space: str = "iv"
+
+    # Pooled cross-asset global model (single ensemble across assets) using a shared PCA basis.
+    tree_enable_global_model: bool = False
+    tree_global_use_asset_onehot: bool = True
+
+    # Confidence-aware shrinkage using ensemble disagreement -> calibration-only isotonic scaling.
+    tree_enable_uncertainty_shrinkage: bool = False
+    tree_uncertainty_scale_min: float = 0.0
+    tree_uncertainty_scale_max: float = 1.25
+    tree_uncertainty_min_calibration_rows: int = 48
+
+    # Time-decayed sample weighting to handle non-stationarity (multiplies existing focus weights).
+    tree_enable_time_decay_weight: bool = False
+    tree_time_decay_halflife_pairs: float = 120.0
+    tree_time_decay_min_weight: float = 0.25
+
+    # Arbitrage-inspired postprocessing (calendar monotonicity + convexity in strike) in total-variance space.
+    tree_postprocess_noarb: bool = False
+    tree_postprocess_noarb_strength: float = 1.0
+    tree_postprocess_noarb_calendar: bool = True
+    tree_postprocess_noarb_convex: bool = True
+
 
 
 def _load_dataset(dataset_path: Path) -> dict[str, np.ndarray]:
@@ -275,6 +305,371 @@ def _iv_to_surface_raw_numpy(iv_surface: np.ndarray, tenor_days: np.ndarray, sur
     tau = (tenor_days.astype(np.float32) / 365.0).reshape(1, 1, -1)
     w = np.square(np.clip(iv_surface, 1e-4, 4.0)) * np.clip(tau, 1e-6, None)
     return np.clip(w, 1e-8, 8.0).astype(np.float32)
+
+
+def _target_space_name(v: str | None) -> str:
+    s = str(v or "").strip().lower()
+    if s in {"w", "total_variance", "total_var"}:
+        return "total_variance"
+    if s in {"log_total_variance", "log_w", "logw"}:
+        return "log_total_variance"
+    return "iv"
+
+
+def _iv_to_total_variance_numpy(iv_surface: np.ndarray, tenor_days: np.ndarray) -> np.ndarray:
+    tau = (tenor_days.astype(np.float32) / 365.0).reshape(1, 1, -1)
+    iv = np.clip(iv_surface.astype(np.float32), 1e-4, 4.0)
+    return (iv * iv) * np.clip(tau, 1e-6, None)
+
+
+def _total_variance_to_iv_numpy(w_surface: np.ndarray, tenor_days: np.ndarray) -> np.ndarray:
+    tau = (tenor_days.astype(np.float32) / 365.0).reshape(1, 1, -1)
+    w = np.clip(w_surface.astype(np.float32), 1e-8, None)
+    iv = np.sqrt(np.clip(w / np.clip(tau, 1e-6, None), 1e-8, None))
+    return np.clip(iv, 1e-4, 4.0).astype(np.float32)
+
+
+def _iv_to_target_numpy(iv_surface: np.ndarray, tenor_days: np.ndarray, target_space: str | None) -> np.ndarray:
+    t = _target_space_name(target_space)
+    if t == "iv":
+        return np.clip(iv_surface, 1e-4, 4.0).astype(np.float32)
+    w = _iv_to_total_variance_numpy(iv_surface, tenor_days).astype(np.float32)
+    if t == "total_variance":
+        return np.clip(w, 1e-8, 8.0).astype(np.float32)
+    # log_total_variance
+    return np.log(np.clip(w, 1e-8, None)).astype(np.float32)
+
+
+def _target_to_iv_numpy(target_surface: np.ndarray, tenor_days: np.ndarray, target_space: str | None) -> np.ndarray:
+    t = _target_space_name(target_space)
+    if t == "iv":
+        return np.clip(target_surface, 1e-4, 4.0).astype(np.float32)
+    if t == "total_variance":
+        return _total_variance_to_iv_numpy(target_surface, tenor_days)
+    # log_total_variance
+    w = np.exp(np.clip(target_surface, np.log(1e-8), np.log(8.0))).astype(np.float32)
+    return _total_variance_to_iv_numpy(w, tenor_days)
+
+
+def _clip_target_flat(x: np.ndarray, target_space: str | None) -> np.ndarray:
+    t = _target_space_name(target_space)
+    if t == "iv":
+        return np.clip(x, 1e-4, 4.0).astype(np.float32)
+    if t == "total_variance":
+        return np.clip(x, 1e-8, 8.0).astype(np.float32)
+    lo = float(np.log(1e-8))
+    hi = float(np.log(8.0))
+    return np.clip(x, lo, hi).astype(np.float32)
+
+
+def _time_decay_weights(pair_pos: np.ndarray, halflife_pairs: float, min_weight: float) -> np.ndarray:
+    if len(pair_pos) == 0:
+        return np.array([], dtype=np.float32)
+    hl = float(halflife_pairs)
+    if not np.isfinite(hl) or hl <= 0.0:
+        return np.ones(len(pair_pos), dtype=np.float32)
+    min_w = float(np.clip(float(min_weight), 0.0, 1.0))
+    age = float(np.max(pair_pos)) - pair_pos.astype(np.float64)
+    decay = np.exp(-np.log(2.0) * age / hl)
+    decay = np.clip(decay, min_w, 1.0)
+    return decay.astype(np.float32)
+
+
+def _predict_factor_delta_members(
+    ensemble: list[list[dict[str, object]]],
+    x: np.ndarray,
+) -> np.ndarray:
+    """Return per-member predictions with shape (n_members, n_rows, k)."""
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if len(ensemble) == 0:
+        return np.zeros((0, len(x), 1), dtype=np.float32)
+    n_members = len(ensemble)
+    k = len(ensemble[0])
+    out = np.zeros((n_members, len(x), k), dtype=np.float32)
+    for m, member in enumerate(ensemble):
+        for j, spec in enumerate(member):
+            kind = str(spec.get("kind", "const"))
+            if kind == "hgb":
+                mdl = spec.get("model")
+                out[m, :, j] = 0.0 if mdl is None else np.asarray(mdl.predict(x), dtype=np.float32)
+            else:
+                out[m, :, j] = float(spec.get("value", 0.0))
+    return out.astype(np.float32)
+
+
+def _delta_uncertainty_scalar(delta_members: np.ndarray) -> np.ndarray:
+    """Scalar uncertainty from per-member delta preds; output shape (n_rows,)."""
+    if delta_members.ndim != 3 or delta_members.shape[0] <= 1:
+        n_rows = int(delta_members.shape[1]) if delta_members.ndim == 3 else 0
+        return np.zeros(n_rows, dtype=np.float32)
+    var = np.var(delta_members.astype(np.float64), axis=0)  # (n_rows, k)
+    u = np.sqrt(np.mean(var, axis=1))
+    return u.astype(np.float32)
+
+
+def _predict_factor_delta_with_regimes_and_members(
+    *,
+    x: np.ndarray,
+    level_values: np.ndarray,
+    global_ensemble: list[list[dict[str, object]]],
+    regime_ensembles: dict[int, list[list[dict[str, object]]]],
+    regime_bounds: tuple[float, float],
+    blend_weight: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict delta mean and a scalar disagreement-based uncertainty."""
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if len(x) == 0:
+        return np.zeros((0, 1), dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    global_members = _predict_factor_delta_members(global_ensemble, x)
+    delta_global = np.mean(global_members, axis=0).astype(np.float32)
+    unc_global = _delta_uncertainty_scalar(global_members)
+
+    if len(regime_ensembles) == 0:
+        return delta_global, unc_global
+    w = float(np.clip(float(blend_weight), 0.0, 1.0))
+    if w <= 0.0:
+        return delta_global, unc_global
+
+    levels = np.asarray(level_values, dtype=np.float32).reshape(-1)
+    if len(levels) != len(x):
+        raise RuntimeError(
+            f"Regime level length mismatch: levels={len(levels)} x_rows={len(x)}"
+        )
+    labels = np.digitize(
+        levels.astype(np.float64),
+        [float(regime_bounds[0]), float(regime_bounds[1])],
+    ).astype(np.int32)
+
+    out_mean = delta_global.copy()
+    out_unc = unc_global.copy()
+
+    for regime, ens in regime_ensembles.items():
+        mask = labels == int(regime)
+        if not np.any(mask):
+            continue
+        # If we can compute members for regimes with matching ensemble size, blend per-member.
+        if len(ens) == len(global_ensemble) and len(global_ensemble) > 0:
+            reg_members = _predict_factor_delta_members(ens, x[mask])  # (m, rows, k)
+            glob_members = global_members[:, mask, :]
+            blended_members = (1.0 - w) * glob_members + w * reg_members
+            out_mean[mask] = np.mean(blended_members, axis=0).astype(np.float32)
+            out_unc[mask] = _delta_uncertainty_scalar(blended_members)
+        else:
+            reg_mean = _predict_factor_delta(ens, x[mask]).astype(np.float32)
+            out_mean[mask] = (1.0 - w) * out_mean[mask] + w * reg_mean
+            # keep out_unc from global
+    return out_mean, out_unc
+
+
+def _optimal_row_scale(
+    *,
+    delta: np.ndarray,
+    y_true: np.ndarray,
+    base_scale: float,
+    scale_min: float,
+    scale_max: float,
+) -> np.ndarray:
+    """Row-wise scalar g that best fits base_scale * g * delta ~= y_true (LS)."""
+    d = delta.astype(np.float64)
+    y = y_true.astype(np.float64)
+    denom = np.sum(d * d, axis=1) + 1e-12
+    num = np.sum(d * y, axis=1)
+    base = float(max(abs(float(base_scale)), 1e-6))
+    g = num / (denom * base)
+    g = np.clip(g, float(scale_min), float(scale_max))
+    return g.astype(np.float32)
+
+
+def _isotonic_increasing(y: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Pure-numpy PAV isotonic regression (increasing)."""
+    v = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(len(v))
+    if n <= 1:
+        return v.copy()
+
+    start: list[int] = []
+    end: list[int] = []
+    weight: list[float] = []
+    value: list[float] = []
+
+    for i in range(n):
+        start.append(i)
+        end.append(i)
+        weight.append(1.0)
+        value.append(float(v[i]))
+        while len(value) >= 2 and value[-2] > value[-1] + float(eps):
+            w1 = weight[-2]
+            w2 = weight[-1]
+            new_w = w1 + w2
+            new_v = (w1 * value[-2] + w2 * value[-1]) / max(new_w, float(eps))
+            end[-2] = end[-1]
+            weight[-2] = new_w
+            value[-2] = float(new_v)
+            start.pop()
+            end.pop()
+            weight.pop()
+            value.pop()
+
+    out = np.empty(n, dtype=np.float64)
+    for s, e, val in zip(start, end, value):
+        out[s : e + 1] = float(val)
+    return out
+
+
+def _convexify_1d(y: np.ndarray) -> np.ndarray:
+    """Approx convex projection for uniform x-grid via isotonic on first-differences."""
+    yy = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(len(yy))
+    if n <= 2:
+        return yy.copy()
+    d = np.diff(yy)  # slopes
+    d_hat = _isotonic_increasing(d)
+    y_hat = yy[0] + np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(d_hat)])
+    # allow constant shift to reduce bias (does not affect convexity)
+    y_hat = y_hat + (np.mean(yy) - np.mean(y_hat))
+    return y_hat
+
+
+def _noarb_project_total_variance(
+    w: np.ndarray,
+    *,
+    enforce_calendar: bool,
+    enforce_convex: bool,
+) -> np.ndarray:
+    w0 = np.asarray(w, dtype=np.float64)
+    if w0.ndim != 2:
+        raise RuntimeError(f"Expected 2D (nx, nt) total-variance grid, got {w0.shape}")
+    out = w0.copy()
+
+    if bool(enforce_calendar):
+        out = np.maximum.accumulate(out, axis=1)
+
+    if bool(enforce_convex):
+        nx, nt = out.shape
+        for t in range(nt):
+            out[:, t] = _convexify_1d(out[:, t])
+
+    # Re-apply calendar monotonicity in case convexification perturbed it slightly.
+    if bool(enforce_calendar):
+        out = np.maximum.accumulate(out, axis=1)
+
+    return np.clip(out, 1e-8, 8.0).astype(np.float32)
+
+
+def _postprocess_noarb_iv(
+    iv_grid: np.ndarray,
+    tenor_days: np.ndarray,
+    *,
+    strength: float,
+    enforce_calendar: bool,
+    enforce_convex: bool,
+) -> np.ndarray:
+    iv0 = np.asarray(iv_grid, dtype=np.float32)
+    s = float(np.clip(float(strength), 0.0, 1.0))
+    if s <= 0.0:
+        return np.clip(iv0, 1e-4, 4.0).astype(np.float32)
+
+    w0 = _iv_to_total_variance_numpy(iv0.reshape(1, *iv0.shape), tenor_days)[0]
+    w_proj = _noarb_project_total_variance(
+        w0,
+        enforce_calendar=bool(enforce_calendar),
+        enforce_convex=bool(enforce_convex),
+    )
+    w_blend = (1.0 - s) * w0.astype(np.float32) + s * w_proj.astype(np.float32)
+    # Ensure final is still projected (blend can slightly violate constraints).
+    w_final = _noarb_project_total_variance(
+        w_blend,
+        enforce_calendar=bool(enforce_calendar),
+        enforce_convex=bool(enforce_convex),
+    )
+    iv_final = _total_variance_to_iv_numpy(w_final.reshape(1, *w_final.shape), tenor_days)[0]
+    return np.clip(iv_final, 1e-4, 4.0).astype(np.float32)
+
+
+def _apply_noarb_postprocess_to_target_flat(
+    *,
+    pred_flat: np.ndarray,
+    nx: int,
+    nt: int,
+    tenor_days: np.ndarray,
+    target_space: str | None,
+    strength: float,
+    enforce_calendar: bool,
+    enforce_convex: bool,
+) -> np.ndarray:
+    pred_flat = np.asarray(pred_flat, dtype=np.float32).reshape(-1)
+    if pred_flat.size != int(nx * nt):
+        raise RuntimeError(
+            f"Pred flat length mismatch: got {pred_flat.size}, expected {nx * nt}"
+        )
+    iv = _target_to_iv_numpy(pred_flat.reshape(1, nx, nt), tenor_days, target_space)[0]
+    iv_pp = _postprocess_noarb_iv(
+        iv,
+        tenor_days,
+        strength=float(strength),
+        enforce_calendar=bool(enforce_calendar),
+        enforce_convex=bool(enforce_convex),
+    )
+    tgt = _iv_to_target_numpy(iv_pp.reshape(1, nx, nt), tenor_days, target_space)[0]
+    return tgt.reshape(-1).astype(np.float32)
+
+
+def _fit_global_pca_basis_by_asset(
+    flat_surface: np.ndarray,
+    asset_ids: np.ndarray,
+    trainval_mask: np.ndarray,
+    max_factors: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shared PCA basis on per-asset demeaned surfaces using train+val only."""
+    flat = np.asarray(flat_surface, dtype=np.float32)
+    aid = np.asarray(asset_ids, dtype=np.int32).reshape(-1)
+    mask = np.asarray(trainval_mask, dtype=bool).reshape(-1)
+    if len(flat) != len(aid) or len(flat) != len(mask):
+        raise RuntimeError("Global PCA inputs length mismatch.")
+
+    n_assets = int(np.max(aid)) + 1 if len(aid) else 1
+    d = int(flat.shape[1])
+    ref_mu_by_asset = np.zeros((n_assets, d), dtype=np.float32)
+
+    residuals: list[np.ndarray] = []
+    for a in range(n_assets):
+        rows = np.where((aid == a) & mask)[0]
+        if len(rows) == 0:
+            rows = np.where(aid == a)[0]
+        if len(rows) == 0:
+            continue
+        mu = np.mean(flat[rows].astype(np.float64), axis=0).astype(np.float32)
+        ref_mu_by_asset[a] = mu
+        residuals.append((flat[rows] - mu).astype(np.float32))
+
+    if not residuals:
+        return ref_mu_by_asset, np.eye(d, dtype=np.float32)[:1]
+
+    ref = np.concatenate(residuals, axis=0).astype(np.float64)
+    try:
+        _, _, vt = np.linalg.svd(ref, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return ref_mu_by_asset, np.eye(d, dtype=np.float32)[:1]
+    if vt.size == 0:
+        return ref_mu_by_asset, np.eye(d, dtype=np.float32)[:1]
+    k = int(max(1, min(int(max_factors), vt.shape[0], d)))
+    comps = vt[:k].astype(np.float32)
+    return ref_mu_by_asset.astype(np.float32), comps
+
+
+def _asset_onehot(asset_ids: np.ndarray, n_assets: int) -> np.ndarray:
+    aid = np.asarray(asset_ids, dtype=np.int32).reshape(-1)
+    n = int(len(aid))
+    k = int(max(1, n_assets))
+    out = np.zeros((n, k), dtype=np.float32)
+    valid = (aid >= 0) & (aid < k)
+    if np.any(valid):
+        rows = np.where(valid)[0]
+        out[rows, aid[rows]] = 1.0
+    return out.astype(np.float32)
 
 
 def _load_focus_density_by_asset(
@@ -846,8 +1241,10 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
 
     surface_key = "surface" if "surface" in ds else "iv_surface"
     surface_raw_obs = ds[surface_key].astype(np.float32)
+
     context = ds["context"].astype(np.float32)
     context_names = ds.get("context_names", np.array([], dtype=str)).astype(str).tolist()
+
     contract_features = ds["contract_features"].astype(np.float32)
     contract_feature_names = ds.get("contract_feature_names", np.array([], dtype=str)).astype(str).tolist()
     contract_date_idx = ds["contract_date_index"].astype(np.int32)
@@ -918,10 +1315,18 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     )
     context_scaled = context_scaler.transform(context)
 
+    # Always score in IV space.
     iv_obs = _surface_to_iv_numpy(surface_raw_obs.astype(np.float32), tenor_days, surface_variable)
-    iv_flat = iv_obs.reshape(n_dates, -1).astype(np.float32)
 
-    max_factors = int(max(1, min(cfg.tree_pca_factors, cfg.latent_dim, iv_flat.shape[1])))
+    # Optional target-space transform for factor/PCA modeling.
+    target_space = _target_space_name(cfg.tree_target_space)
+    target_obs = _iv_to_target_numpy(iv_obs.astype(np.float32), tenor_days, target_space)
+    target_flat = target_obs.reshape(n_dates, -1).astype(np.float32)
+
+    # Tenor calibration is defined in IV space only; disable silently otherwise.
+    tenor_calibration_enabled = bool(cfg.tree_enable_tenor_calibration) and target_space == "iv"
+
+    max_factors = int(max(1, min(cfg.tree_pca_factors, cfg.latent_dim, target_flat.shape[1])))
     min_history = int(max(10, cfg.tree_min_history))
 
     focus_grid = _focus_grid(
@@ -952,422 +1357,841 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
             nx=nx,
             nt=nt,
         )
+
     residual_enabled = bool(cfg.tree_enable_residual_corrector)
     residual_factors = max(int(cfg.tree_residual_factors), 1)
     residual_scale_max = max(float(cfg.tree_residual_scale_max), 0.0)
 
+    # Output buffers in target space; converted back to IV at the end.
     latent = np.zeros((n_dates, max_factors), dtype=np.float32)
-    recon_flat = iv_flat.copy()
-    forecast_flat = iv_flat.copy()
+    recon_flat = target_flat.copy()
+    forecast_flat = target_flat.copy()
 
     history_rows: list[dict[str, object]] = []
     asset_model_payloads: list[dict[str, object]] = []
 
-    for aid in range(n_assets):
-        seq = np.where(asset_ids == aid)[0]
-        if len(seq) <= 1:
-            continue
-
-        iv_asset = iv_obs[seq].astype(np.float32)
-        flat_asset = iv_asset.reshape(len(seq), -1).astype(np.float32)
-        ctx_asset = context_scaled[seq].astype(np.float32)
-        cnn_asset = _cnn_surface_features(iv_asset, tenor_days)
-
-        pair_pos = np.where(trainval_mask[seq[:-1]] & trainval_mask[seq[1:]])[0].astype(np.int32)
-
-        ref_mu, components = _fit_pca_basis(flat_asset, pair_pos, max_factors)
+    # ------------------------------------------------------------
+    # Global cross-asset model (shared PCA basis + pooled delta model).
+    # ------------------------------------------------------------
+    if bool(cfg.tree_enable_global_model):
+        # Shared PCA basis on train+val only, after per-asset demeaning.
+        ref_mu_by_asset, components = _fit_global_pca_basis_by_asset(
+            target_flat,
+            asset_ids=asset_ids,
+            trainval_mask=trainval_mask,
+            max_factors=max_factors,
+        )
         k = int(components.shape[0])
 
-        factors = ((flat_asset - ref_mu) @ components.T).astype(np.float32)
-        recon_local = np.clip(ref_mu + (factors @ components), 1e-4, 4.0).astype(np.float32)
+        # Factors for all dates in the shared basis.
+        ref_mu_for_rows = ref_mu_by_asset[asset_ids.astype(np.int32)]
+        factors_all = ((target_flat - ref_mu_for_rows) @ components.T).astype(np.float32)
 
-        feats = _build_factor_feature_matrix(factors, cnn_asset, ctx_asset)
+        # Build per-asset lagged features (same logic as per-asset model), then append optional one-hot.
+        cnn_all = _cnn_surface_features(iv_obs.astype(np.float32), tenor_days)
+        feats_all = np.zeros(
+            (n_dates, (k * 5) + (cnn_all.shape[1] * 2) + context_scaled.shape[1]),
+            dtype=np.float32,
+        )
+        for aid in range(n_assets):
+            seq = np.where(asset_ids == aid)[0]
+            if len(seq) == 0:
+                continue
+            seq = np.sort(seq)
+            feats_all[seq] = _build_factor_feature_matrix(
+                factors_all[seq],
+                cnn_all[seq],
+                context_scaled[seq].astype(np.float32),
+            )
 
-        trained = False
-        blend_alpha = 0.0
-        ensemble: list[list[dict[str, object]]] = []
-        residual_trained = False
-        residual_scale = 0.0
-        residual_components = np.zeros((1, flat_asset.shape[1]), dtype=np.float32)
-        residual_ensemble: list[list[dict[str, object]]] = []
-        regime_trained = False
-        regime_blend_weight = 0.0
-        regime_bounds = (0.0, 0.0)
-        regime_ensembles: dict[int, list[list[dict[str, object]]]] = {}
-        level_series = cnn_asset[:, 0].astype(np.float32)
-        tenor_cal_a = np.zeros(nt, dtype=np.float32)
-        tenor_cal_b = np.ones(nt, dtype=np.float32)
+        if bool(cfg.tree_global_use_asset_onehot) and n_assets > 1:
+            feats_all = np.concatenate([feats_all, _asset_onehot(asset_ids, n_assets)], axis=1).astype(np.float32)
 
-        if len(pair_pos) >= min_history:
-            cal_frac = float(np.clip(float(cfg.tree_calibration_frac), 0.0, 0.45))
-            cal_n = int(max(cfg.tree_min_calibration_rows, round(len(pair_pos) * cal_frac)))
-            cal_n = min(cal_n, max(0, len(pair_pos) - min_history))
-            fit_n = int(len(pair_pos) - cal_n)
+        # Build train+val pair indices by asset (never cross assets).
+        # NOTE: keep per-asset alignment so calibration splits can be done per asset safely.
+        pair_entry_by_asset: list[np.ndarray] = [np.array([], dtype=np.int64) for _ in range(n_assets)]
+        pair_target_by_asset: list[np.ndarray] = [np.array([], dtype=np.int64) for _ in range(n_assets)]
+        pair_asset_by_asset: list[np.ndarray] = [np.array([], dtype=np.int32) for _ in range(n_assets)]
+        for aid in range(n_assets):
+            seq = np.where(asset_ids == aid)[0]
+            if len(seq) <= 1:
+                continue
+            seq = np.sort(seq)
+            pos = np.where(trainval_mask[seq[:-1]] & trainval_mask[seq[1:]])[0].astype(np.int32)
+            if len(pos) == 0:
+                continue
+            pair_entry_by_asset[aid] = seq[pos].astype(np.int64)
+            pair_target_by_asset[aid] = seq[pos + 1].astype(np.int64)
+            pair_asset_by_asset[aid] = np.full(len(pos), aid, dtype=np.int32)
 
-            pair_fit = pair_pos[:fit_n] if fit_n > 0 else pair_pos
-            pair_cal = pair_pos[fit_n:] if cal_n > 0 else np.array([], dtype=np.int32)
+        valid_assets = [aid for aid in range(n_assets) if len(pair_entry_by_asset[aid]) > 0]
+        if not valid_assets:
+            raise RuntimeError("Global model: no train/val one-step pairs available.")
 
-            x_fit = feats[pair_fit]
-            y_fit = (factors[pair_fit + 1] - factors[pair_fit]).astype(np.float32)
+        pair_entry = np.concatenate([pair_entry_by_asset[aid] for aid in valid_assets]).astype(np.int64)
+        pair_target = np.concatenate([pair_target_by_asset[aid] for aid in valid_assets]).astype(np.int64)
+        pair_asset = np.concatenate([pair_asset_by_asset[aid] for aid in valid_assets]).astype(np.int32)
 
+
+        # Calibration split per asset: hold out the tail of each asset's trainval pairs.
+        cal_frac = float(np.clip(float(cfg.tree_calibration_frac), 0.0, 0.45))
+        min_cal = int(max(0, cfg.tree_min_calibration_rows))
+        pair_fit_mask = np.ones(len(pair_entry), dtype=bool)
+        pair_cal_mask = np.zeros(len(pair_entry), dtype=bool)
+
+        # We compute the mask by iterating assets and selecting tail indices within that asset's pairs.
+        offset = 0
+        for aid in valid_assets:
+            # Pairs are concatenated in valid_assets order (ascending aid), so we can slice.
+            n_pairs = int(len(pair_entry_by_asset[aid]))
+            if n_pairs <= 0:
+                continue
+            sl = slice(offset, offset + n_pairs)
+            offset += n_pairs
+
+            cal_n = int(max(min_cal, round(n_pairs * cal_frac))) if cal_frac > 0 else 0
+            cal_n = min(cal_n, max(0, n_pairs - min_history))
+            if cal_n <= 0:
+                continue
+            # Use the *most recent* pairs (tail of sequence).
+            idx_local = np.arange(n_pairs - cal_n, n_pairs, dtype=np.int64)
+            pair_fit_mask[sl][idx_local] = False
+            pair_cal_mask[sl][idx_local] = True
+
+        # Ensure we have fit samples.
+        if not np.any(pair_fit_mask):
+            pair_fit_mask[:] = True
+            pair_cal_mask[:] = False
+
+        entry_fit = pair_entry[pair_fit_mask]
+        target_fit = pair_target[pair_fit_mask]
+        aid_fit = pair_asset[pair_fit_mask]
+
+        x_fit = feats_all[entry_fit].astype(np.float32)
+        y_fit = (factors_all[target_fit] - factors_all[entry_fit]).astype(np.float32)
+
+        # Sample weights: focus (and optional density map) + optional time decay by asset.
+        w_fit = np.ones(len(entry_fit), dtype=np.float32)
+        for i, (e_idx, t_idx, aid) in enumerate(zip(entry_fit, target_fit, aid_fit, strict=False)):
+            move = np.abs(iv_obs[t_idx] - iv_obs[e_idx]).astype(np.float64)
             density_grid = (
-                focus_density_by_asset[aid]
-                if (focus_density_by_asset is not None and 0 <= aid < len(focus_density_by_asset))
+                focus_density_by_asset[int(aid)]
+                if (focus_density_by_asset is not None and 0 <= int(aid) < len(focus_density_by_asset))
                 else None
             )
-            w_fit = _sample_weight_from_focus(
-                iv_asset=iv_asset,
-                pair_pos=pair_fit,
-                base_focus_grid=focus_grid,
-                focus_alpha=max(float(cfg.surface_focus_alpha), 0.0),
-                density_grid=density_grid,
-                density_alpha=focus_density_alpha,
+            g = focus_grid.astype(np.float64)
+            if density_grid is not None and focus_density_alpha > 0.0:
+                d = np.clip(density_grid.astype(np.float64), 1e-8, None)
+                g = g * np.power(d, float(focus_density_alpha))
+            g = g / max(float(np.mean(g)), 1e-8)
+            w_fit[i] = np.float32(1.0 + max(float(cfg.surface_focus_alpha), 0.0) * float(np.mean(move * g)))
+        w_fit = np.clip(w_fit, 1.0, 8.0).astype(np.float32)
+
+        # Optional time decay (within each asset, on entry position rank).
+        if bool(cfg.tree_enable_time_decay_weight):
+            # Build an "age" proxy from per-asset pair order.
+            w_time = np.ones(len(entry_fit), dtype=np.float32)
+            for aid in range(n_assets):
+                mask = aid_fit == aid
+                if not np.any(mask):
+                    continue
+                # Use the order in the original asset sequence.
+                seq = np.where(asset_ids == aid)[0]
+                seq = np.sort(seq)
+                rank = {int(v): int(i) for i, v in enumerate(seq)}
+                pos = np.asarray([rank.get(int(e), 0) for e in entry_fit[mask]], dtype=np.int64)
+                w_time[mask] = _time_decay_weights(
+                    pos.astype(np.int32),
+                    halflife_pairs=float(cfg.tree_time_decay_halflife_pairs),
+                    min_weight=float(cfg.tree_time_decay_min_weight),
+                )
+            w_fit = (w_fit * w_time).astype(np.float32)
+
+        seeds = tuple(int(s) for s in cfg.tree_ensemble_seeds if int(s) >= 0) or (13,)
+
+        global_ensemble = _fit_factor_ensemble(
+            x_train=x_fit,
+            y_train=y_fit,
+            seeds=seeds,
+            learning_rate=float(cfg.tree_learning_rate),
+            max_iter=int(cfg.tree_max_iter),
+            max_depth=int(cfg.tree_max_depth),
+            min_samples_leaf=int(cfg.tree_min_samples_leaf),
+            l2_regularization=float(cfg.tree_l2_regularization),
+            sample_weight=(w_fit if bool(cfg.tree_use_sample_weight) else None),
+            max_cpu_threads=int(cfg.max_cpu_threads),
+        )
+
+        # Calibrate per-asset blend alpha on that asset's held-out tail pairs.
+        alpha_grid = np.linspace(0.2, 1.2, 11)
+        blend_alpha_by_asset = np.ones(n_assets, dtype=np.float32)
+        if np.any(pair_cal_mask):
+            entry_cal = pair_entry[pair_cal_mask]
+            target_cal = pair_target[pair_cal_mask]
+            aid_cal = pair_asset[pair_cal_mask]
+            delta_cal = _predict_factor_delta(global_ensemble, feats_all[entry_cal].astype(np.float32)).astype(np.float32)
+            for aid in range(n_assets):
+                mask = aid_cal == aid
+                if not np.any(mask):
+                    continue
+                best_alpha = 1.0
+                best_mse = float("inf")
+                y_true = target_flat[target_cal[mask]]
+                f0 = factors_all[entry_cal[mask]]
+                d0 = delta_cal[mask]
+                for a in alpha_grid:
+                    f_pred = f0 + float(a) * d0
+                    y_pred = ref_mu_by_asset[aid] + (f_pred @ components)
+                    y_pred = _clip_target_flat(y_pred, target_space)
+                    mse = float(np.mean((y_pred - y_true) ** 2))
+                    if mse < best_mse:
+                        best_mse = mse
+                        best_alpha = float(a)
+                blend_alpha_by_asset[aid] = np.float32(best_alpha)
+
+        # Optional uncertainty shrinkage: fit a single isotonic map on pooled calibration pairs.
+        uncertainty_model = None
+        if bool(cfg.tree_enable_uncertainty_shrinkage) and np.any(pair_cal_mask) and len(seeds) > 1:
+            entry_cal = pair_entry[pair_cal_mask]
+            target_cal = pair_target[pair_cal_mask]
+            x_cal = feats_all[entry_cal].astype(np.float32)
+            y_true_delta = (factors_all[target_cal] - factors_all[entry_cal]).astype(np.float32)
+
+            delta_mean, unc = _predict_factor_delta_with_regimes_and_members(
+                x=x_cal,
+                level_values=cnn_all[entry_cal, 0],
+                global_ensemble=global_ensemble,
+                regime_ensembles={},
+                regime_bounds=(0.0, 0.0),
+                blend_weight=0.0,
+            )
+            # Use per-asset base alpha in the scale target.
+            base_scale = blend_alpha_by_asset[aid_cal.astype(np.int32)]
+            base_scale = np.clip(base_scale, 0.05, 3.0)
+            g_opt = np.zeros(len(entry_cal), dtype=np.float32)
+            for i in range(len(entry_cal)):
+                g_opt[i] = _optimal_row_scale(
+                    delta=delta_mean[i : i + 1],
+                    y_true=y_true_delta[i : i + 1],
+                    base_scale=float(base_scale[i]),
+                    scale_min=float(cfg.tree_uncertainty_scale_min),
+                    scale_max=float(cfg.tree_uncertainty_scale_max),
+                )[0]
+            if len(g_opt) >= int(max(8, cfg.tree_uncertainty_min_calibration_rows)):
+                # IsotonicRegression is monotone increasing; use x = -unc so larger uncertainty => smaller x.
+                iso = IsotonicRegression(increasing=True, out_of_bounds="clip")
+                iso.fit(-unc.astype(np.float64), g_opt.astype(np.float64))
+                uncertainty_model = iso
+
+        # Forecast in target space for all assets.
+        forecast_local = target_flat.copy()
+        for aid in range(n_assets):
+            seq = np.where(asset_ids == aid)[0]
+            if len(seq) <= 1:
+                continue
+            seq = np.sort(seq)
+            x_pred = feats_all[seq[:-1]].astype(np.float32)
+
+            if bool(cfg.tree_enable_uncertainty_shrinkage) and uncertainty_model is not None and len(seeds) > 1:
+                delta_mean, unc = _predict_factor_delta_with_regimes_and_members(
+                    x=x_pred,
+                    level_values=cnn_all[seq[:-1], 0],
+                    global_ensemble=global_ensemble,
+                    regime_ensembles={},
+                    regime_bounds=(0.0, 0.0),
+                    blend_weight=0.0,
+                )
+                scale = uncertainty_model.predict(-unc.astype(np.float64)).astype(np.float32)
+            else:
+                delta_mean = _predict_factor_delta(global_ensemble, x_pred).astype(np.float32)
+                scale = np.ones(len(seq) - 1, dtype=np.float32)
+
+            alpha = float(blend_alpha_by_asset[aid])
+            for j in range(len(seq) - 1):
+                f_pred = factors_all[seq[j]] + alpha * float(scale[j]) * delta_mean[j]
+                pred_flat = ref_mu_by_asset[aid] + (f_pred @ components)
+
+                # Optional postprocess (in IV / total-variance space, then map back to target).
+                if bool(cfg.tree_postprocess_noarb):
+                    pred_flat = _apply_noarb_postprocess_to_target_flat(
+                        pred_flat=pred_flat,
+                        nx=nx,
+                        nt=nt,
+                        tenor_days=tenor_days,
+                        target_space=target_space,
+                        strength=float(cfg.tree_postprocess_noarb_strength),
+                        enforce_calendar=bool(cfg.tree_postprocess_noarb_calendar),
+                        enforce_convex=bool(cfg.tree_postprocess_noarb_convex),
+                    )
+
+                forecast_local[seq[j]] = _clip_target_flat(pred_flat, target_space)
+
+            # History summary rows per asset.
+            history_rows.append(
+                {
+                    "asset_id": int(aid),
+                    "asset": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
+                    "trained": True,
+                    "n_asset_dates": int(len(seq)),
+                    "n_trainval_pairs": int(np.sum(trainval_mask[seq[:-1]] & trainval_mask[seq[1:]])),
+                    "factor_k": int(k),
+                    "blend_alpha": float(blend_alpha_by_asset[aid]),
+                    "regime_trained": False,
+                    "regime_blend_weight": 0.0,
+                    "tenor_calibration_enabled": False,
+                    "tenor_calibration_mean_abs_a": 0.0,
+                    "tenor_calibration_mean_b": 1.0,
+                    "residual_trained": False,
+                    "residual_scale": 0.0,
+                    "residual_factor_k": 0,
+                    "fallback_persistence_days": 0,
+                    "global_model": True,
+                    "target_space": str(target_space),
+                }
+            )
+            asset_model_payloads.append(
+                {
+                    "asset_id": int(aid),
+                    "asset_name": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
+                    "trained": True,
+                    "global_model": True,
+                    "target_space": str(target_space),
+                    "factor_k": int(k),
+                    "blend_alpha": float(blend_alpha_by_asset[aid]),
+                    "ref_mu": ref_mu_by_asset[aid].astype(np.float32),
+                    "components": components,
+                    "ensemble": global_ensemble,
+                    "uncertainty_shrinkage_enabled": bool(cfg.tree_enable_uncertainty_shrinkage and uncertainty_model is not None),
+                    "uncertainty_model": uncertainty_model,
+                    "fallback_persistence_days": 0,
+                }
             )
 
-            seeds = tuple(int(s) for s in cfg.tree_ensemble_seeds if int(s) >= 0)
-            if not seeds:
-                seeds = (13,)
+        # Write outputs.
+        forecast_flat = forecast_local.astype(np.float32)
+        recon_flat = _clip_target_flat((ref_mu_for_rows + (factors_all @ components)), target_space).astype(np.float32)
+        latent[:, :k] = factors_all[:, :k].astype(np.float32)
 
-            ensemble_fit = _fit_factor_ensemble(
-                x_train=x_fit,
-                y_train=y_fit,
-                seeds=seeds,
-                learning_rate=float(cfg.tree_learning_rate),
-                max_iter=int(cfg.tree_max_iter),
-                max_depth=int(cfg.tree_max_depth),
-                min_samples_leaf=int(cfg.tree_min_samples_leaf),
-                l2_regularization=float(cfg.tree_l2_regularization),
-                sample_weight=(w_fit if bool(cfg.tree_use_sample_weight) else None),
-                max_cpu_threads=int(cfg.max_cpu_threads),
-            )
+    # ------------------------------------------------------------
+    # Per-asset model (existing v4 pipeline + v5 feature flags).
+    # ------------------------------------------------------------
+    else:
+        for aid in range(n_assets):
+            seq = np.where(asset_ids == aid)[0]
+            if len(seq) <= 1:
+                continue
 
-            regime_fit_ensembles: dict[int, list[list[dict[str, object]]]] = {}
-            regime_fit_bounds = (0.0, 0.0)
-            if bool(cfg.tree_enable_regime_experts):
-                regime_fit_ensembles, regime_fit_bounds = _fit_regime_ensembles(
+            seq = np.sort(seq)
+            iv_asset = iv_obs[seq].astype(np.float32)
+            tgt_asset = target_obs[seq].astype(np.float32)
+            flat_asset = tgt_asset.reshape(len(seq), -1).astype(np.float32)
+
+            ctx_asset = context_scaled[seq].astype(np.float32)
+            cnn_asset = _cnn_surface_features(iv_asset, tenor_days)
+
+            # Train+val one-step pairs within this asset (local positions).
+            pair_pos = np.where(trainval_mask[seq[:-1]] & trainval_mask[seq[1:]])[0].astype(np.int32)
+
+            ref_mu, components = _fit_pca_basis(flat_asset, pair_pos, max_factors)
+            k = int(components.shape[0])
+
+            factors = ((flat_asset - ref_mu) @ components.T).astype(np.float32)
+            recon_local = _clip_target_flat(ref_mu + (factors @ components), target_space).astype(np.float32)
+
+            feats = _build_factor_feature_matrix(factors, cnn_asset, ctx_asset)
+
+            trained = False
+            blend_alpha = 0.0
+            ensemble: list[list[dict[str, object]]] = []
+
+            residual_trained = False
+            residual_scale = 0.0
+            residual_components = np.zeros((1, flat_asset.shape[1]), dtype=np.float32)
+            residual_ensemble: list[list[dict[str, object]]] = []
+
+            regime_trained = False
+            regime_blend_weight = 0.0
+            regime_bounds = (0.0, 0.0)
+            regime_ensembles: dict[int, list[list[dict[str, object]]]] = {}
+
+            # Confidence shrink mapping (optional).
+            uncertainty_model = None
+
+            level_series = cnn_asset[:, 0].astype(np.float32)
+            tenor_cal_a = np.zeros(nt, dtype=np.float32)
+            tenor_cal_b = np.ones(nt, dtype=np.float32)
+
+            if len(pair_pos) >= min_history:
+                cal_frac = float(np.clip(float(cfg.tree_calibration_frac), 0.0, 0.45))
+                cal_n = int(max(cfg.tree_min_calibration_rows, round(len(pair_pos) * cal_frac)))
+                cal_n = min(cal_n, max(0, len(pair_pos) - min_history))
+                fit_n = int(len(pair_pos) - cal_n)
+
+                pair_fit = pair_pos[:fit_n] if fit_n > 0 else pair_pos
+                pair_cal = pair_pos[fit_n:] if cal_n > 0 else np.array([], dtype=np.int32)
+
+                x_fit = feats[pair_fit]
+                y_fit = (factors[pair_fit + 1] - factors[pair_fit]).astype(np.float32)
+
+                density_grid = (
+                    focus_density_by_asset[aid]
+                    if (focus_density_by_asset is not None and 0 <= aid < len(focus_density_by_asset))
+                    else None
+                )
+                w_fit = _sample_weight_from_focus(
+                    iv_asset=iv_asset,
                     pair_pos=pair_fit,
-                    feats=feats,
-                    factors=factors,
-                    level_series=level_series,
-                    sample_weight=w_fit,
-                    min_rows=int(max(20, cfg.tree_regime_min_rows // 2)),
+                    base_focus_grid=focus_grid,
+                    focus_alpha=max(float(cfg.surface_focus_alpha), 0.0),
+                    density_grid=density_grid,
+                    density_alpha=focus_density_alpha,
+                )
+                if bool(cfg.tree_enable_time_decay_weight):
+                    w_fit = (w_fit * _time_decay_weights(
+                        pair_fit,
+                        halflife_pairs=float(cfg.tree_time_decay_halflife_pairs),
+                        min_weight=float(cfg.tree_time_decay_min_weight),
+                    )).astype(np.float32)
+
+                seeds = tuple(int(s) for s in cfg.tree_ensemble_seeds if int(s) >= 0) or (13,)
+
+                ensemble_fit = _fit_factor_ensemble(
+                    x_train=x_fit,
+                    y_train=y_fit,
                     seeds=seeds,
                     learning_rate=float(cfg.tree_learning_rate),
                     max_iter=int(cfg.tree_max_iter),
                     max_depth=int(cfg.tree_max_depth),
                     min_samples_leaf=int(cfg.tree_min_samples_leaf),
                     l2_regularization=float(cfg.tree_l2_regularization),
+                    sample_weight=(w_fit if bool(cfg.tree_use_sample_weight) else None),
                     max_cpu_threads=int(cfg.max_cpu_threads),
-                    use_sample_weight=bool(cfg.tree_use_sample_weight),
                 )
 
-            if len(pair_cal) > 0:
-                x_cal = feats[pair_cal]
-                y_true_cal = flat_asset[pair_cal + 1]
-                alpha_grid = np.linspace(0.2, 1.2, 11)
-                regime_grid = np.linspace(0.0, 1.0, 5) if len(regime_fit_ensembles) > 0 else np.array([0.0], dtype=np.float32)
-                best_alpha = 1.0
-                best_regime_w = 0.0
-                best_mse = float("inf")
-                for regime_w in regime_grid:
-                    delta_cal = _predict_factor_delta_with_regimes(
+                regime_fit_ensembles: dict[int, list[list[dict[str, object]]]] = {}
+                regime_fit_bounds = (0.0, 0.0)
+                if bool(cfg.tree_enable_regime_experts):
+                    regime_fit_ensembles, regime_fit_bounds = _fit_regime_ensembles(
+                        pair_pos=pair_fit,
+                        feats=feats,
+                        factors=factors,
+                        level_series=level_series,
+                        sample_weight=w_fit,
+                        min_rows=int(max(20, cfg.tree_regime_min_rows // 2)),
+                        seeds=seeds,
+                        learning_rate=float(cfg.tree_learning_rate),
+                        max_iter=int(cfg.tree_max_iter),
+                        max_depth=int(cfg.tree_max_depth),
+                        min_samples_leaf=int(cfg.tree_min_samples_leaf),
+                        l2_regularization=float(cfg.tree_l2_regularization),
+                        max_cpu_threads=int(cfg.max_cpu_threads),
+                        use_sample_weight=bool(cfg.tree_use_sample_weight),
+                    )
+
+                # Calibration for blend alpha (and regime blend weight, if enabled).
+                if len(pair_cal) > 0:
+                    x_cal = feats[pair_cal]
+                    y_true_cal = flat_asset[pair_cal + 1]
+                    alpha_grid = np.linspace(0.2, 1.2, 11)
+                    regime_grid = (
+                        np.linspace(0.0, 1.0, 5)
+                        if len(regime_fit_ensembles) > 0
+                        else np.array([0.0], dtype=np.float32)
+                    )
+                    best_alpha = 1.0
+                    best_regime_w = 0.0
+                    best_mse = float("inf")
+                    for regime_w in regime_grid:
+                        delta_cal = _predict_factor_delta_with_regimes(
+                            x=x_cal,
+                            level_values=level_series[pair_cal],
+                            global_ensemble=ensemble_fit,
+                            regime_ensembles=regime_fit_ensembles,
+                            regime_bounds=regime_fit_bounds,
+                            blend_weight=float(regime_w),
+                        )
+                        for alpha in alpha_grid:
+                            f_pred = factors[pair_cal] + float(alpha) * delta_cal
+                            y_pred = ref_mu + (f_pred @ components)
+                            y_pred = _clip_target_flat(y_pred, target_space)
+                            mse = float(np.mean((y_pred - y_true_cal) ** 2))
+                            if mse < best_mse:
+                                best_mse = mse
+                                best_alpha = float(alpha)
+                                best_regime_w = float(regime_w)
+                    blend_alpha = float(best_alpha)
+                    regime_blend_weight = float(best_regime_w)
+                else:
+                    blend_alpha = 1.0
+                    regime_blend_weight = 0.0
+
+                # Optional tenor calibration (IV-space only).
+                if tenor_calibration_enabled and len(pair_cal) > 0:
+                    delta_cal_for_tenor = _predict_factor_delta_with_regimes(
+                        x=feats[pair_cal],
+                        level_values=level_series[pair_cal],
+                        global_ensemble=ensemble_fit,
+                        regime_ensembles=regime_fit_ensembles,
+                        regime_bounds=regime_fit_bounds,
+                        blend_weight=float(regime_blend_weight),
+                    ).astype(np.float32)
+                    pred_cal_flat = _clip_target_flat(
+                        ref_mu + ((factors[pair_cal] + float(blend_alpha) * delta_cal_for_tenor) @ components),
+                        target_space,
+                    ).astype(np.float32)
+                    true_cal_flat = flat_asset[pair_cal + 1].astype(np.float32)
+
+                    pred_cal_grid = pred_cal_flat.reshape(len(pair_cal), nx, nt)
+                    true_cal_grid = true_cal_flat.reshape(len(pair_cal), nx, nt)
+                    shrink = float(np.clip(float(cfg.tree_tenor_calibration_shrinkage), 0.0, 1.0))
+                    slope_min = float(cfg.tree_tenor_slope_min)
+                    slope_max = max(float(cfg.tree_tenor_slope_max), slope_min)
+                    for tj in range(nt):
+                        p = pred_cal_grid[:, :, tj].reshape(-1).astype(np.float64)
+                        y = true_cal_grid[:, :, tj].reshape(-1).astype(np.float64)
+                        if len(p) == 0:
+                            continue
+                        p_mean = float(np.mean(p))
+                        y_mean = float(np.mean(y))
+                        var_p = float(np.mean((p - p_mean) ** 2))
+                        if var_p > 1e-12:
+                            cov_py = float(np.mean((p - p_mean) * (y - y_mean)))
+                            slope = cov_py / var_p
+                        else:
+                            slope = 1.0
+                        slope = (1.0 - shrink) * slope + shrink * 1.0
+                        slope = float(np.clip(slope, slope_min, slope_max))
+                        intercept = float(y_mean - slope * p_mean)
+                        tenor_cal_b[tj] = np.float32(slope)
+                        tenor_cal_a[tj] = np.float32(intercept)
+
+                # Fit final models on all train+val pairs for this asset.
+                x_all = feats[pair_pos]
+                y_all = (factors[pair_pos + 1] - factors[pair_pos]).astype(np.float32)
+                w_all = _sample_weight_from_focus(
+                    iv_asset=iv_asset,
+                    pair_pos=pair_pos,
+                    base_focus_grid=focus_grid,
+                    focus_alpha=max(float(cfg.surface_focus_alpha), 0.0),
+                    density_grid=density_grid,
+                    density_alpha=focus_density_alpha,
+                )
+                if bool(cfg.tree_enable_time_decay_weight):
+                    w_all = (w_all * _time_decay_weights(
+                        pair_pos,
+                        halflife_pairs=float(cfg.tree_time_decay_halflife_pairs),
+                        min_weight=float(cfg.tree_time_decay_min_weight),
+                    )).astype(np.float32)
+
+                ensemble = _fit_factor_ensemble(
+                    x_train=x_all,
+                    y_train=y_all,
+                    seeds=seeds,
+                    learning_rate=float(cfg.tree_learning_rate),
+                    max_iter=int(cfg.tree_max_iter),
+                    max_depth=int(cfg.tree_max_depth),
+                    min_samples_leaf=int(cfg.tree_min_samples_leaf),
+                    l2_regularization=float(cfg.tree_l2_regularization),
+                    sample_weight=(w_all if bool(cfg.tree_use_sample_weight) else None),
+                    max_cpu_threads=int(cfg.max_cpu_threads),
+                )
+                if bool(cfg.tree_enable_regime_experts):
+                    regime_ensembles, regime_bounds = _fit_regime_ensembles(
+                        pair_pos=pair_pos,
+                        feats=feats,
+                        factors=factors,
+                        level_series=level_series,
+                        sample_weight=w_all,
+                        min_rows=int(max(20, cfg.tree_regime_min_rows)),
+                        seeds=seeds,
+                        learning_rate=float(cfg.tree_learning_rate),
+                        max_iter=int(cfg.tree_max_iter),
+                        max_depth=int(cfg.tree_max_depth),
+                        min_samples_leaf=int(cfg.tree_min_samples_leaf),
+                        l2_regularization=float(cfg.tree_l2_regularization),
+                        max_cpu_threads=int(cfg.max_cpu_threads),
+                        use_sample_weight=bool(cfg.tree_use_sample_weight),
+                    )
+                    regime_trained = bool(len(regime_ensembles) > 0 and regime_blend_weight > 0.0)
+                trained = True
+
+                # Optional uncertainty shrink calibration (calibration-only, uses member disagreement).
+                if (
+                    bool(cfg.tree_enable_uncertainty_shrinkage)
+                    and len(pair_cal) >= int(max(8, cfg.tree_uncertainty_min_calibration_rows))
+                    and len(seeds) > 1
+                ):
+                    x_cal = feats[pair_cal].astype(np.float32)
+                    y_true_delta = (factors[pair_cal + 1] - factors[pair_cal]).astype(np.float32)
+                    delta_mean, unc = _predict_factor_delta_with_regimes_and_members(
                         x=x_cal,
                         level_values=level_series[pair_cal],
                         global_ensemble=ensemble_fit,
                         regime_ensembles=regime_fit_ensembles,
                         regime_bounds=regime_fit_bounds,
-                        blend_weight=float(regime_w),
+                        blend_weight=float(regime_blend_weight),
                     )
-                    for alpha in alpha_grid:
-                        f_pred = factors[pair_cal] + float(alpha) * delta_cal
-                        y_pred = np.clip(ref_mu + (f_pred @ components), 1e-4, 4.0)
-                        mse = float(np.mean((y_pred - y_true_cal) ** 2))
-                        if mse < best_mse:
-                            best_mse = mse
-                            best_alpha = float(alpha)
-                            best_regime_w = float(regime_w)
-                blend_alpha = float(best_alpha)
-                regime_blend_weight = float(best_regime_w)
-            else:
-                blend_alpha = 1.0
-                regime_blend_weight = 0.0
-
-            if bool(cfg.tree_enable_tenor_calibration) and len(pair_cal) > 0:
-                delta_cal_for_tenor = _predict_factor_delta_with_regimes(
-                    x=feats[pair_cal],
-                    level_values=level_series[pair_cal],
-                    global_ensemble=ensemble_fit,
-                    regime_ensembles=regime_fit_ensembles,
-                    regime_bounds=regime_fit_bounds,
-                    blend_weight=float(regime_blend_weight),
-                ).astype(np.float32)
-                pred_cal_flat = np.clip(
-                    ref_mu + ((factors[pair_cal] + float(blend_alpha) * delta_cal_for_tenor) @ components),
-                    1e-4,
-                    4.0,
-                ).astype(np.float32)
-                true_cal_flat = flat_asset[pair_cal + 1].astype(np.float32)
-                pred_cal_grid = pred_cal_flat.reshape(len(pair_cal), nx, nt)
-                true_cal_grid = true_cal_flat.reshape(len(pair_cal), nx, nt)
-                shrink = float(np.clip(float(cfg.tree_tenor_calibration_shrinkage), 0.0, 1.0))
-                slope_min = float(cfg.tree_tenor_slope_min)
-                slope_max = max(float(cfg.tree_tenor_slope_max), slope_min)
-                for tj in range(nt):
-                    p = pred_cal_grid[:, :, tj].reshape(-1).astype(np.float64)
-                    y = true_cal_grid[:, :, tj].reshape(-1).astype(np.float64)
-                    if len(p) == 0:
-                        continue
-                    p_mean = float(np.mean(p))
-                    y_mean = float(np.mean(y))
-                    var_p = float(np.mean((p - p_mean) ** 2))
-                    if var_p > 1e-12:
-                        cov_py = float(np.mean((p - p_mean) * (y - y_mean)))
-                        slope = cov_py / var_p
-                    else:
-                        slope = 1.0
-                    slope = (1.0 - shrink) * slope + shrink * 1.0
-                    slope = float(np.clip(slope, slope_min, slope_max))
-                    intercept = float(y_mean - slope * p_mean)
-                    tenor_cal_b[tj] = np.float32(slope)
-                    tenor_cal_a[tj] = np.float32(intercept)
-
-            x_all = feats[pair_pos]
-            y_all = (factors[pair_pos + 1] - factors[pair_pos]).astype(np.float32)
-            w_all = _sample_weight_from_focus(
-                iv_asset=iv_asset,
-                pair_pos=pair_pos,
-                base_focus_grid=focus_grid,
-                focus_alpha=max(float(cfg.surface_focus_alpha), 0.0),
-                density_grid=density_grid,
-                density_alpha=focus_density_alpha,
-            )
-            ensemble = _fit_factor_ensemble(
-                x_train=x_all,
-                y_train=y_all,
-                seeds=seeds,
-                learning_rate=float(cfg.tree_learning_rate),
-                max_iter=int(cfg.tree_max_iter),
-                max_depth=int(cfg.tree_max_depth),
-                min_samples_leaf=int(cfg.tree_min_samples_leaf),
-                l2_regularization=float(cfg.tree_l2_regularization),
-                sample_weight=(w_all if bool(cfg.tree_use_sample_weight) else None),
-                max_cpu_threads=int(cfg.max_cpu_threads),
-            )
-            if bool(cfg.tree_enable_regime_experts):
-                regime_ensembles, regime_bounds = _fit_regime_ensembles(
-                    pair_pos=pair_pos,
-                    feats=feats,
-                    factors=factors,
-                    level_series=level_series,
-                    sample_weight=w_all,
-                    min_rows=int(max(20, cfg.tree_regime_min_rows)),
-                    seeds=seeds,
-                    learning_rate=float(cfg.tree_learning_rate),
-                    max_iter=int(cfg.tree_max_iter),
-                    max_depth=int(cfg.tree_max_depth),
-                    min_samples_leaf=int(cfg.tree_min_samples_leaf),
-                    l2_regularization=float(cfg.tree_l2_regularization),
-                    max_cpu_threads=int(cfg.max_cpu_threads),
-                    use_sample_weight=bool(cfg.tree_use_sample_weight),
-                )
-                regime_trained = bool(len(regime_ensembles) > 0 and regime_blend_weight > 0.0)
-            trained = True
-
-            if residual_enabled and len(pair_fit) >= max(24, min_history // 2):
-                delta_fit_primary = _predict_factor_delta_with_regimes(
-                    x=feats[pair_fit],
-                    level_values=level_series[pair_fit],
-                    global_ensemble=ensemble_fit,
-                    regime_ensembles=regime_fit_ensembles,
-                    regime_bounds=regime_fit_bounds,
-                    blend_weight=float(regime_blend_weight),
-                ).astype(np.float32)
-                base_fit = np.clip(
-                    ref_mu + ((factors[pair_fit] + float(blend_alpha) * delta_fit_primary) @ components),
-                    1e-4,
-                    4.0,
-                ).astype(np.float32)
-                residual_fit_flat = (flat_asset[pair_fit + 1] - base_fit).astype(np.float32)
-
-                res_basis_ok = False
-                if residual_fit_flat.shape[0] >= 4:
-                    try:
-                        _, _, vt_res = np.linalg.svd(residual_fit_flat.astype(np.float64), full_matrices=False)
-                        if vt_res.size > 0:
-                            kr = int(min(residual_factors, vt_res.shape[0], max(1, residual_fit_flat.shape[0] - 1)))
-                            residual_components = vt_res[:kr].astype(np.float32)
-                            res_basis_ok = kr > 0
-                    except np.linalg.LinAlgError:
-                        res_basis_ok = False
-
-                if res_basis_ok:
-                    x_res_fit = np.concatenate([feats[pair_fit], delta_fit_primary, factors[pair_fit]], axis=1).astype(np.float32)
-                    y_res_fit = (residual_fit_flat @ residual_components.T).astype(np.float32)
-                    residual_ensemble_fit = _fit_factor_ensemble(
-                        x_train=x_res_fit,
-                        y_train=y_res_fit,
-                        seeds=seeds,
-                        learning_rate=float(cfg.tree_residual_learning_rate),
-                        max_iter=int(cfg.tree_residual_max_iter),
-                        max_depth=int(cfg.tree_residual_max_depth),
-                        min_samples_leaf=int(cfg.tree_residual_min_samples_leaf),
-                        l2_regularization=float(cfg.tree_residual_l2_regularization),
-                        sample_weight=(w_fit if bool(cfg.tree_use_sample_weight) else None),
-                        max_cpu_threads=int(cfg.max_cpu_threads),
+                    g_opt = _optimal_row_scale(
+                        delta=delta_mean,
+                        y_true=y_true_delta,
+                        base_scale=float(blend_alpha),
+                        scale_min=float(cfg.tree_uncertainty_scale_min),
+                        scale_max=float(cfg.tree_uncertainty_scale_max),
                     )
+                    iso = IsotonicRegression(increasing=True, out_of_bounds="clip")
+                    iso.fit(-unc.astype(np.float64), g_opt.astype(np.float64))
+                    uncertainty_model = iso
 
-                    residual_scale = 1.0
-                    if len(pair_cal) > 0 and residual_scale_max > 0.0:
-                        delta_cal_primary = _predict_factor_delta_with_regimes(
-                            x=feats[pair_cal],
-                            level_values=level_series[pair_cal],
-                            global_ensemble=ensemble_fit,
-                            regime_ensembles=regime_fit_ensembles,
-                            regime_bounds=regime_fit_bounds,
+                # Residual corrector (unchanged logic, operates in target space).
+                if residual_enabled and len(pair_fit) >= max(24, min_history // 2):
+                    delta_fit_primary = _predict_factor_delta_with_regimes(
+                        x=feats[pair_fit],
+                        level_values=level_series[pair_fit],
+                        global_ensemble=ensemble_fit,
+                        regime_ensembles=regime_fit_ensembles,
+                        regime_bounds=regime_fit_bounds,
+                        blend_weight=float(regime_blend_weight),
+                    ).astype(np.float32)
+                    base_fit = _clip_target_flat(
+                        ref_mu + ((factors[pair_fit] + float(blend_alpha) * delta_fit_primary) @ components),
+                        target_space,
+                    ).astype(np.float32)
+                    residual_fit_flat = (flat_asset[pair_fit + 1] - base_fit).astype(np.float32)
+
+                    res_basis_ok = False
+                    if residual_fit_flat.shape[0] >= 4:
+                        try:
+                            _, _, vt_res = np.linalg.svd(residual_fit_flat.astype(np.float64), full_matrices=False)
+                            if vt_res.size > 0:
+                                kr = int(min(residual_factors, vt_res.shape[0], max(1, residual_fit_flat.shape[0] - 1)))
+                                residual_components = vt_res[:kr].astype(np.float32)
+                                res_basis_ok = kr > 0
+                        except np.linalg.LinAlgError:
+                            res_basis_ok = False
+
+                    if res_basis_ok:
+                        x_res_fit = np.concatenate([feats[pair_fit], delta_fit_primary, factors[pair_fit]], axis=1).astype(np.float32)
+                        y_res_fit = (residual_fit_flat @ residual_components.T).astype(np.float32)
+                        residual_ensemble_fit = _fit_factor_ensemble(
+                            x_train=x_res_fit,
+                            y_train=y_res_fit,
+                            seeds=seeds,
+                            learning_rate=float(cfg.tree_residual_learning_rate),
+                            max_iter=int(cfg.tree_residual_max_iter),
+                            max_depth=int(cfg.tree_residual_max_depth),
+                            min_samples_leaf=int(cfg.tree_residual_min_samples_leaf),
+                            l2_regularization=float(cfg.tree_residual_l2_regularization),
+                            sample_weight=(w_fit if bool(cfg.tree_use_sample_weight) else None),
+                            max_cpu_threads=int(cfg.max_cpu_threads),
+                        )
+
+                        residual_scale = 1.0
+                        if len(pair_cal) > 0 and residual_scale_max > 0.0:
+                            delta_cal_primary = _predict_factor_delta_with_regimes(
+                                x=feats[pair_cal],
+                                level_values=level_series[pair_cal],
+                                global_ensemble=ensemble_fit,
+                                regime_ensembles=regime_fit_ensembles,
+                                regime_bounds=regime_fit_bounds,
+                                blend_weight=float(regime_blend_weight),
+                            ).astype(np.float32)
+                            base_cal = _clip_target_flat(
+                                ref_mu + ((factors[pair_cal] + float(blend_alpha) * delta_cal_primary) @ components),
+                                target_space,
+                            ).astype(np.float32)
+                            x_res_cal = np.concatenate([feats[pair_cal], delta_cal_primary, factors[pair_cal]], axis=1).astype(np.float32)
+                            res_cal_coef = _predict_factor_delta(residual_ensemble_fit, x_res_cal).astype(np.float32)
+                            res_cal_flat = (res_cal_coef @ residual_components).astype(np.float32)
+                            y_true_cal = flat_asset[pair_cal + 1].astype(np.float32)
+
+                            best_gamma = 1.0
+                            best_mse = float("inf")
+                            gamma_grid = np.linspace(0.0, float(residual_scale_max), 13)
+                            for gamma in gamma_grid:
+                                y_pred = _clip_target_flat(base_cal + float(gamma) * res_cal_flat, target_space)
+                                mse = float(np.mean((y_pred - y_true_cal) ** 2))
+                                if mse < best_mse:
+                                    best_mse = mse
+                                    best_gamma = float(gamma)
+                            residual_scale = float(best_gamma)
+
+                        delta_all_primary = _predict_factor_delta_with_regimes(
+                            x=feats[pair_pos],
+                            level_values=level_series[pair_pos],
+                            global_ensemble=ensemble,
+                            regime_ensembles=regime_ensembles,
+                            regime_bounds=regime_bounds,
                             blend_weight=float(regime_blend_weight),
                         ).astype(np.float32)
-                        base_cal = np.clip(
-                            ref_mu + ((factors[pair_cal] + float(blend_alpha) * delta_cal_primary) @ components),
-                            1e-4,
-                            4.0,
+                        base_all = _clip_target_flat(
+                            ref_mu + ((factors[pair_pos] + float(blend_alpha) * delta_all_primary) @ components),
+                            target_space,
                         ).astype(np.float32)
-                        x_res_cal = np.concatenate([feats[pair_cal], delta_cal_primary, factors[pair_cal]], axis=1).astype(np.float32)
-                        res_cal_coef = _predict_factor_delta(residual_ensemble_fit, x_res_cal).astype(np.float32)
-                        res_cal_flat = (res_cal_coef @ residual_components).astype(np.float32)
-                        y_true_cal = flat_asset[pair_cal + 1].astype(np.float32)
+                        residual_all_flat = (flat_asset[pair_pos + 1] - base_all).astype(np.float32)
+                        x_res_all = np.concatenate([feats[pair_pos], delta_all_primary, factors[pair_pos]], axis=1).astype(np.float32)
+                        y_res_all = (residual_all_flat @ residual_components.T).astype(np.float32)
 
-                        best_gamma = 1.0
-                        best_mse = float("inf")
-                        gamma_grid = np.linspace(0.0, float(residual_scale_max), 13)
-                        for gamma in gamma_grid:
-                            y_pred = np.clip(base_cal + float(gamma) * res_cal_flat, 1e-4, 4.0)
-                            mse = float(np.mean((y_pred - y_true_cal) ** 2))
-                            if mse < best_mse:
-                                best_mse = mse
-                                best_gamma = float(gamma)
-                        residual_scale = float(best_gamma)
+                        residual_ensemble = _fit_factor_ensemble(
+                            x_train=x_res_all,
+                            y_train=y_res_all,
+                            seeds=seeds,
+                            learning_rate=float(cfg.tree_residual_learning_rate),
+                            max_iter=int(cfg.tree_residual_max_iter),
+                            max_depth=int(cfg.tree_residual_max_depth),
+                            min_samples_leaf=int(cfg.tree_residual_min_samples_leaf),
+                            l2_regularization=float(cfg.tree_residual_l2_regularization),
+                            sample_weight=(w_all if bool(cfg.tree_use_sample_weight) else None),
+                            max_cpu_threads=int(cfg.max_cpu_threads),
+                        )
+                        residual_trained = True
 
-                    delta_all_primary = _predict_factor_delta_with_regimes(
-                        x=feats[pair_pos],
-                        level_values=level_series[pair_pos],
+            # Forecast generation (batch delta prediction for speed).
+            forecast_local = flat_asset.copy()
+            fallback_days = int(len(seq) - 1)
+            if trained and len(ensemble) > 0 and len(seq) > 1:
+                x_pred = feats[: len(seq) - 1].astype(np.float32)
+                if bool(cfg.tree_enable_uncertainty_shrinkage) and uncertainty_model is not None and len(cfg.tree_ensemble_seeds) > 1:
+                    delta_pred, unc_pred = _predict_factor_delta_with_regimes_and_members(
+                        x=x_pred,
+                        level_values=level_series[: len(seq) - 1],
+                        global_ensemble=ensemble,
+                        regime_ensembles=regime_ensembles,
+                        regime_bounds=regime_bounds,
+                        blend_weight=float(regime_blend_weight),
+                    )
+                    scale_pred = uncertainty_model.predict(-unc_pred.astype(np.float64)).astype(np.float32)
+                else:
+                    delta_pred = _predict_factor_delta_with_regimes(
+                        x=x_pred,
+                        level_values=level_series[: len(seq) - 1],
                         global_ensemble=ensemble,
                         regime_ensembles=regime_ensembles,
                         regime_bounds=regime_bounds,
                         blend_weight=float(regime_blend_weight),
                     ).astype(np.float32)
-                    base_all = np.clip(
-                        ref_mu + ((factors[pair_pos] + float(blend_alpha) * delta_all_primary) @ components),
-                        1e-4,
-                        4.0,
-                    ).astype(np.float32)
-                    residual_all_flat = (flat_asset[pair_pos + 1] - base_all).astype(np.float32)
-                    x_res_all = np.concatenate([feats[pair_pos], delta_all_primary, factors[pair_pos]], axis=1).astype(np.float32)
-                    y_res_all = (residual_all_flat @ residual_components.T).astype(np.float32)
+                    scale_pred = np.ones(len(seq) - 1, dtype=np.float32)
 
-                    residual_ensemble = _fit_factor_ensemble(
-                        x_train=x_res_all,
-                        y_train=y_res_all,
-                        seeds=seeds,
-                        learning_rate=float(cfg.tree_residual_learning_rate),
-                        max_iter=int(cfg.tree_residual_max_iter),
-                        max_depth=int(cfg.tree_residual_max_depth),
-                        min_samples_leaf=int(cfg.tree_residual_min_samples_leaf),
-                        l2_regularization=float(cfg.tree_residual_l2_regularization),
-                        sample_weight=(w_all if bool(cfg.tree_use_sample_weight) else None),
-                        max_cpu_threads=int(cfg.max_cpu_threads),
-                    )
-                    residual_trained = True
+                for i in range(len(seq) - 1):
+                    delta = delta_pred[i]
+                    f_pred = factors[i] + float(blend_alpha) * float(scale_pred[i]) * delta
+                    pred_flat = ref_mu + (f_pred @ components)
 
-        forecast_local = flat_asset.copy()
-        fallback_days = int(len(seq) - 1)
-        if trained and len(ensemble) > 0:
-            for i in range(len(seq) - 1):
-                delta = _predict_factor_delta_with_regimes(
-                    x=feats[i : i + 1],
-                    level_values=level_series[i : i + 1],
-                    global_ensemble=ensemble,
-                    regime_ensembles=regime_ensembles,
-                    regime_bounds=regime_bounds,
-                    blend_weight=float(regime_blend_weight),
-                )[0]
-                f_pred = factors[i] + float(blend_alpha) * delta
-                pred_flat = ref_mu + (f_pred @ components)
-                if residual_trained and len(residual_ensemble) > 0:
-                    x_res_i = np.concatenate(
-                        [
-                            feats[i : i + 1],
-                            delta.reshape(1, -1).astype(np.float32),
-                            factors[i : i + 1],
-                        ],
-                        axis=1,
-                    ).astype(np.float32)
-                    res_coef_i = _predict_factor_delta(residual_ensemble, x_res_i)[0].astype(np.float32)
-                    pred_flat = pred_flat + float(residual_scale) * (res_coef_i @ residual_components)
-                if bool(cfg.tree_enable_tenor_calibration):
-                    pred_grid = pred_flat.reshape(nx, nt)
-                    pred_grid = tenor_cal_a.reshape(1, nt) + tenor_cal_b.reshape(1, nt) * pred_grid
-                    pred_flat = pred_grid.reshape(-1)
-                forecast_local[i] = np.clip(pred_flat, 1e-4, 4.0)
-                fallback_days -= 1
-        fallback_days = int(max(0, fallback_days))
+                    if residual_trained and len(residual_ensemble) > 0:
+                        x_res_i = np.concatenate(
+                            [
+                                feats[i : i + 1],
+                                delta.reshape(1, -1).astype(np.float32),
+                                factors[i : i + 1],
+                            ],
+                            axis=1,
+                        ).astype(np.float32)
+                        res_coef_i = _predict_factor_delta(residual_ensemble, x_res_i)[0].astype(np.float32)
+                        pred_flat = pred_flat + float(residual_scale) * (res_coef_i @ residual_components)
 
-        recon_flat[seq] = recon_local
-        forecast_flat[seq] = forecast_local
-        latent[seq, :k] = factors[:, :k]
+                    if tenor_calibration_enabled:
+                        pred_grid = pred_flat.reshape(nx, nt)
+                        pred_grid = tenor_cal_a.reshape(1, nt) + tenor_cal_b.reshape(1, nt) * pred_grid
+                        pred_flat = pred_grid.reshape(-1)
 
-        asset_model_payloads.append(
-            {
-                "asset_id": int(aid),
-                "asset_name": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
-                "trained": bool(trained),
-                "factor_k": int(k),
-                "blend_alpha": float(blend_alpha),
-                "regime_trained": bool(regime_trained),
-                "regime_blend_weight": float(regime_blend_weight),
-                "regime_bounds": [float(regime_bounds[0]), float(regime_bounds[1])],
-                "tenor_calibration_enabled": bool(cfg.tree_enable_tenor_calibration),
-                "tenor_calibration_a": tenor_cal_a.astype(np.float32),
-                "tenor_calibration_b": tenor_cal_b.astype(np.float32),
-                "residual_trained": bool(residual_trained),
-                "residual_scale": float(residual_scale),
-                "residual_factor_k": int(residual_components.shape[0] if residual_trained else 0),
-                "ref_mu": ref_mu.astype(np.float32),
-                "components": components.astype(np.float32),
-                "ensemble": ensemble,
-                "regime_ensembles": regime_ensembles if regime_trained else {},
-                "residual_components": (residual_components.astype(np.float32) if residual_trained else np.empty((0, flat_asset.shape[1]), dtype=np.float32)),
-                "residual_ensemble": residual_ensemble if residual_trained else [],
-                "min_history": int(min_history),
-                "fallback_persistence_days": int(fallback_days),
-            }
-        )
+                    if bool(cfg.tree_postprocess_noarb):
+                        pred_flat = _apply_noarb_postprocess_to_target_flat(
+                            pred_flat=pred_flat,
+                            nx=nx,
+                            nt=nt,
+                            tenor_days=tenor_days,
+                            target_space=target_space,
+                            strength=float(cfg.tree_postprocess_noarb_strength),
+                            enforce_calendar=bool(cfg.tree_postprocess_noarb_calendar),
+                            enforce_convex=bool(cfg.tree_postprocess_noarb_convex),
+                        )
 
-        history_rows.append(
-            {
-                "asset_id": int(aid),
-                "asset": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
-                "trained": bool(trained),
-                "n_asset_dates": int(len(seq)),
-                "n_trainval_pairs": int(len(pair_pos)),
-                "factor_k": int(k),
-                "blend_alpha": float(blend_alpha),
-                "regime_trained": bool(regime_trained),
-                "regime_blend_weight": float(regime_blend_weight),
-                "tenor_calibration_enabled": bool(cfg.tree_enable_tenor_calibration),
-                "tenor_calibration_mean_abs_a": float(np.mean(np.abs(tenor_cal_a))),
-                "tenor_calibration_mean_b": float(np.mean(tenor_cal_b)),
-                "residual_trained": bool(residual_trained),
-                "residual_scale": float(residual_scale),
-                "residual_factor_k": int(residual_components.shape[0] if residual_trained else 0),
-                "fallback_persistence_days": int(fallback_days),
-            }
-        )
+                    forecast_local[i] = _clip_target_flat(pred_flat, target_space)
+                    fallback_days -= 1
+            fallback_days = int(max(0, fallback_days))
 
-    recon_iv = recon_flat.reshape(n_dates, nx, nt).astype(np.float32)
-    forecast_iv = forecast_flat.reshape(n_dates, nx, nt).astype(np.float32)
+            recon_flat[seq] = recon_local
+            forecast_flat[seq] = forecast_local
+            latent[seq, :k] = factors[:, :k]
+
+            asset_model_payloads.append(
+                {
+                    "asset_id": int(aid),
+                    "asset_name": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
+                    "trained": bool(trained),
+                    "global_model": False,
+                    "target_space": str(target_space),
+                    "factor_k": int(k),
+                    "blend_alpha": float(blend_alpha),
+                    "regime_trained": bool(regime_trained),
+                    "regime_blend_weight": float(regime_blend_weight),
+                    "regime_bounds": [float(regime_bounds[0]), float(regime_bounds[1])],
+                    "tenor_calibration_enabled": bool(tenor_calibration_enabled),
+                    "tenor_calibration_a": tenor_cal_a.astype(np.float32),
+                    "tenor_calibration_b": tenor_cal_b.astype(np.float32),
+                    "residual_trained": bool(residual_trained),
+                    "residual_scale": float(residual_scale),
+                    "residual_factor_k": int(residual_components.shape[0] if residual_trained else 0),
+                    "uncertainty_shrinkage_enabled": bool(cfg.tree_enable_uncertainty_shrinkage and uncertainty_model is not None),
+                    "uncertainty_model": uncertainty_model,
+                    "ref_mu": ref_mu.astype(np.float32),
+                    "components": components.astype(np.float32),
+                    "ensemble": ensemble,
+                    "regime_ensembles": regime_ensembles if regime_trained else {},
+                    "residual_components": (
+                        residual_components.astype(np.float32)
+                        if residual_trained
+                        else np.empty((0, flat_asset.shape[1]), dtype=np.float32)
+                    ),
+                    "residual_ensemble": residual_ensemble if residual_trained else [],
+                    "min_history": int(min_history),
+                    "fallback_persistence_days": int(fallback_days),
+                }
+            )
+
+            history_rows.append(
+                {
+                    "asset_id": int(aid),
+                    "asset": str(asset_names[aid] if 0 <= aid < len(asset_names) else f"asset_{aid}"),
+                    "trained": bool(trained),
+                    "n_asset_dates": int(len(seq)),
+                    "n_trainval_pairs": int(len(pair_pos)),
+                    "factor_k": int(k),
+                    "blend_alpha": float(blend_alpha),
+                    "regime_trained": bool(regime_trained),
+                    "regime_blend_weight": float(regime_blend_weight),
+                    "tenor_calibration_enabled": bool(tenor_calibration_enabled),
+                    "tenor_calibration_mean_abs_a": float(np.mean(np.abs(tenor_cal_a))) if tenor_calibration_enabled else 0.0,
+                    "tenor_calibration_mean_b": float(np.mean(tenor_cal_b)) if tenor_calibration_enabled else 1.0,
+                    "residual_trained": bool(residual_trained),
+                    "residual_scale": float(residual_scale),
+                    "residual_factor_k": int(residual_components.shape[0] if residual_trained else 0),
+                    "fallback_persistence_days": int(fallback_days),
+                    "global_model": False,
+                    "target_space": str(target_space),
+                }
+            )
+
+    # Convert back to IV space for metrics and for surface_variable serialization.
+    recon_target = recon_flat.reshape(n_dates, nx, nt).astype(np.float32)
+    forecast_target = forecast_flat.reshape(n_dates, nx, nt).astype(np.float32)
+    recon_iv = _target_to_iv_numpy(recon_target, tenor_days, target_space).astype(np.float32)
+    forecast_iv = _target_to_iv_numpy(forecast_target, tenor_days, target_space).astype(np.float32)
 
     recon_raw = _iv_to_surface_raw_numpy(recon_iv, tenor_days, surface_variable)
     forecast_raw = _iv_to_surface_raw_numpy(forecast_iv, tenor_days, surface_variable)
+
+    # Tag the model family by enabled v5 extensions for easier tracking.
+    model_family = "tree_boost_surface_v5"
+    if bool(cfg.tree_enable_global_model):
+        model_family = f"{model_family}_global"
+    if target_space != "iv":
+        model_family = f"{model_family}_{target_space}"
+    if bool(cfg.tree_enable_uncertainty_shrinkage):
+        model_family = f"{model_family}_uncert"
+    if bool(cfg.tree_enable_time_decay_weight):
+        model_family = f"{model_family}_timedecay"
+    if bool(cfg.tree_postprocess_noarb):
+        model_family = f"{model_family}_noarb"
 
     run_dir = make_run_dir(cfg.out_dir, prefix="run")
 
@@ -1380,14 +2204,26 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     latent_df.insert(
         2,
         "asset",
-        np.array([asset_names[int(i)] if 0 <= int(i) < len(asset_names) else f"asset_{int(i)}" for i in asset_ids], dtype=object),
+        np.array(
+            [
+                asset_names[int(i)] if 0 <= int(i) < len(asset_names) else f"asset_{int(i)}"
+                for i in asset_ids
+            ],
+            dtype=object,
+        ),
     )
     latent_df.to_parquet(run_dir / "latent_states.parquet", index=False)
 
     artifact = {
-        "model_type": "tree_boost_surface_v4_regime_residual",
+        "model_type": model_family,
         "dataset_path": str(dataset_path.resolve()),
         "surface_variable": str(surface_variable),
+        "tree_target_space": str(target_space),
+        "tree_enable_global_model": bool(cfg.tree_enable_global_model),
+        "tree_global_use_asset_onehot": bool(cfg.tree_global_use_asset_onehot),
+        "tree_enable_uncertainty_shrinkage": bool(cfg.tree_enable_uncertainty_shrinkage),
+        "tree_enable_time_decay_weight": bool(cfg.tree_enable_time_decay_weight),
+        "tree_postprocess_noarb": bool(cfg.tree_postprocess_noarb),
         "x_grid": x_grid.astype(np.float32),
         "tenor_days": tenor_days.astype(np.int32),
         "context_scaler_state": context_scaler.state(),
@@ -1398,12 +2234,18 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
         "tree_min_history": int(min_history),
         "tree_enable_regime_experts": bool(cfg.tree_enable_regime_experts),
         "tree_regime_min_rows": int(max(1, cfg.tree_regime_min_rows)),
-        "tree_enable_tenor_calibration": bool(cfg.tree_enable_tenor_calibration),
+        "tree_enable_tenor_calibration": bool(tenor_calibration_enabled),
         "tree_tenor_calibration_shrinkage": float(cfg.tree_tenor_calibration_shrinkage),
         "tree_tenor_slope_min": float(cfg.tree_tenor_slope_min),
         "tree_tenor_slope_max": float(cfg.tree_tenor_slope_max),
         "tree_enable_residual_corrector": bool(residual_enabled),
         "tree_residual_factors": int(residual_factors),
+        "tree_enable_time_decay_weight": bool(cfg.tree_enable_time_decay_weight),
+        "tree_time_decay_halflife_pairs": float(cfg.tree_time_decay_halflife_pairs),
+        "tree_time_decay_min_weight": float(cfg.tree_time_decay_min_weight),
+        "tree_postprocess_noarb_strength": float(cfg.tree_postprocess_noarb_strength),
+        "tree_postprocess_noarb_calendar": bool(cfg.tree_postprocess_noarb_calendar),
+        "tree_postprocess_noarb_convex": bool(cfg.tree_postprocess_noarb_convex),
         "asset_models": asset_model_payloads,
         "forecast_surface_raw": forecast_raw.astype(np.float32),
         "recon_surface_raw": recon_raw.astype(np.float32),
@@ -1418,7 +2260,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
 
     cfg_payload = asdict(cfg)
     cfg_payload["out_dir"] = str(cfg.out_dir)
-    cfg_payload["model_family"] = "tree_boost_surface_v4_regime_residual"
+    cfg_payload["model_family"] = model_family
     (run_dir / "train_config.json").write_text(json.dumps(cfg_payload, indent=2), encoding="utf-8")
 
     trainval_rmse = _forecast_pairs_rmse(
@@ -1437,8 +2279,14 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     summary = {
         "model_path": str((run_dir / "tree_model.pkl").resolve()),
         "dataset_path": str(dataset_path.resolve()),
-        "model_family": "tree_boost_surface_v4_regime_residual",
+        "model_family": model_family,
         "surface_variable": str(surface_variable),
+        "tree_target_space": str(target_space),
+        "tree_enable_global_model": bool(cfg.tree_enable_global_model),
+        "tree_global_use_asset_onehot": bool(cfg.tree_global_use_asset_onehot),
+        "tree_enable_uncertainty_shrinkage": bool(cfg.tree_enable_uncertainty_shrinkage),
+        "tree_enable_time_decay_weight": bool(cfg.tree_enable_time_decay_weight),
+        "tree_postprocess_noarb": bool(cfg.tree_postprocess_noarb),
         "split_mode": str(split_mode),
         "assets": asset_names,
         "n_assets": int(n_assets),
@@ -1462,7 +2310,7 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
         "max_cpu_threads": int(max(1, cfg.max_cpu_threads)),
         "tree_enable_regime_experts": bool(cfg.tree_enable_regime_experts),
         "tree_regime_min_rows": int(max(1, cfg.tree_regime_min_rows)),
-        "tree_enable_tenor_calibration": bool(cfg.tree_enable_tenor_calibration),
+        "tree_enable_tenor_calibration": bool(tenor_calibration_enabled),
         "tree_tenor_calibration_shrinkage": float(cfg.tree_tenor_calibration_shrinkage),
         "tree_tenor_slope_min": float(cfg.tree_tenor_slope_min),
         "tree_tenor_slope_max": float(cfg.tree_tenor_slope_max),
@@ -1482,7 +2330,6 @@ def train(dataset_path: Path, cfg: TrainingConfig) -> Path:
     (run_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     return run_dir
-
 
 def derive_focus_density_map_from_run(
     *,

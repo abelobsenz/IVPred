@@ -194,6 +194,7 @@ def _surface_forecast_error_profiles(
     persistence_forecast: np.ndarray | None = None,
     parametric_forecast: np.ndarray | None = None,
     tree_forecast: np.ndarray | None = None,
+    garch_forecast: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build absolute forecast error profiles by DTE, by moneyness, and on the DTE-x grid."""
     if obs_forecast.size == 0 or pred_forecast.size == 0:
@@ -206,6 +207,8 @@ def _surface_forecast_error_profiles(
         series_map["parametric"] = parametric_forecast
     if tree_forecast is not None and tree_forecast.shape == obs_forecast.shape:
         series_map["tree"] = tree_forecast
+    if garch_forecast is not None and garch_forecast.shape == obs_forecast.shape:
+        series_map["garch"] = garch_forecast
 
     n_days, nx, nt = obs_forecast.shape
     rows_dte: list[dict[str, float | int | str]] = []
@@ -553,6 +556,299 @@ def _tree_boost_surface_nextday_forecast(
     }
 
 
+def _fit_ar1_coeffs(series: np.ndarray) -> tuple[float, float, np.ndarray]:
+    y = np.asarray(series, dtype=np.float64).reshape(-1)
+    if len(y) < 3:
+        c = float(y[-1]) if len(y) else 0.0
+        return c, 0.0, np.zeros(max(len(y) - 1, 0), dtype=np.float64)
+
+    x = y[:-1]
+    t = y[1:]
+    x_mat = np.column_stack([np.ones(len(x), dtype=np.float64), x])
+    try:
+        beta, *_ = np.linalg.lstsq(x_mat, t, rcond=None)
+        c = float(beta[0])
+        phi = float(beta[1])
+    except Exception:
+        c = float(np.mean(t))
+        phi = 0.0
+    phi = float(np.clip(phi, -0.995, 0.995))
+    resid = t - (c + phi * x)
+    resid = np.asarray(resid, dtype=np.float64)
+    resid[~np.isfinite(resid)] = 0.0
+    return c, phi, resid
+
+
+def _fit_ar1_no_intercept(series: np.ndarray) -> float:
+    z = np.asarray(series, dtype=np.float64).reshape(-1)
+    if len(z) < 3:
+        return 0.0
+    x = z[:-1]
+    y = z[1:]
+    denom = float(np.dot(x, x))
+    if (not np.isfinite(denom)) or denom <= 1e-12:
+        return 0.0
+    rho = float(np.dot(x, y) / denom)
+    if not np.isfinite(rho):
+        return 0.0
+    return float(np.clip(rho, -0.98, 0.98))
+
+
+def _fit_garch11_gaussian_qmle(resid: np.ndarray) -> tuple[float, float, float]:
+    e = np.asarray(resid, dtype=np.float64).reshape(-1)
+    e = e[np.isfinite(e)]
+    if len(e) < 20:
+        var0 = float(np.var(e)) if len(e) else 1e-6
+        var0 = max(var0, 1e-8)
+        alpha = 0.06
+        beta = 0.92
+        omega = var0 * (1.0 - alpha - beta)
+        return float(max(omega, 1e-10)), float(alpha), float(beta)
+
+    var0 = float(np.var(e))
+    var0 = max(var0, 1e-8)
+    best_nll = float("inf")
+    best = (var0 * 0.02, 0.06, 0.92)
+
+    # Coarse but robust grid search under standard GARCH(1,1) constraints.
+    alpha_grid = np.linspace(0.02, 0.20, 10)
+    beta_grid = np.linspace(0.70, 0.98, 15)
+    for alpha in alpha_grid:
+        for beta in beta_grid:
+            if alpha <= 0.0 or beta <= 0.0:
+                continue
+            if alpha + beta >= 0.995:
+                continue
+            omega = var0 * (1.0 - alpha - beta)
+            omega = max(float(omega), 1e-10)
+
+            h_prev = var0
+            nll = 0.0
+            ok = True
+            for t in range(len(e)):
+                if t > 0:
+                    h_prev = omega + alpha * (e[t - 1] ** 2) + beta * h_prev
+                if (not np.isfinite(h_prev)) or h_prev <= 1e-12:
+                    ok = False
+                    break
+                nll += np.log(h_prev) + (e[t] ** 2) / h_prev
+            if not ok:
+                continue
+            if nll < best_nll:
+                best_nll = float(nll)
+                best = (omega, float(alpha), float(beta))
+
+    return float(best[0]), float(best[1]), float(best[2])
+
+
+def _garch11_filter_variance(
+    resid: np.ndarray,
+    *,
+    omega: float,
+    alpha: float,
+    beta: float,
+) -> tuple[np.ndarray, float]:
+    e = np.asarray(resid, dtype=np.float64).reshape(-1)
+    if len(e) == 0:
+        return np.zeros(0, dtype=np.float64), 1e-8
+
+    var0 = float(np.var(e))
+    if (not np.isfinite(var0)) or var0 <= 1e-12:
+        var0 = 1e-8
+
+    w = float(max(float(omega), 1e-10))
+    a = float(np.clip(float(alpha), 1e-6, 0.99))
+    b = float(np.clip(float(beta), 1e-6, 0.99))
+    if a + b >= 0.999:
+        b = 0.999 - a
+        b = float(max(b, 1e-6))
+
+    h = np.empty(len(e), dtype=np.float64)
+    h[0] = var0
+    for t in range(1, len(e)):
+        prev_h = float(h[t - 1]) if np.isfinite(h[t - 1]) else var0
+        prev_e = float(e[t - 1]) if np.isfinite(e[t - 1]) else 0.0
+        h_t = w + a * (prev_e * prev_e) + b * prev_h
+        if (not np.isfinite(h_t)) or h_t <= 1e-12:
+            h_t = var0
+        h[t] = h_t
+    h = np.clip(h, 1e-10, None)
+    return h, var0
+
+
+def _fit_surface_logret_linear_map(
+    *,
+    iv_asset: np.ndarray,
+    atm_log_series: np.ndarray,
+    pair_pos: np.ndarray,
+    ridge: float = 1e-6,
+) -> np.ndarray | None:
+    p = np.asarray(pair_pos, dtype=np.int64).reshape(-1)
+    if len(p) < 12:
+        return None
+    if np.any(p < 0) or np.any((p + 1) >= len(iv_asset)):
+        return None
+
+    prev = np.clip(iv_asset[p].reshape(len(p), -1).astype(np.float64), 1e-6, None)
+    nxt = np.clip(iv_asset[p + 1].reshape(len(p), -1).astype(np.float64), 1e-6, None)
+    y = np.log(nxt) - np.log(prev)
+    x = (atm_log_series[p + 1] - atm_log_series[p]).astype(np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    xmat = np.column_stack([np.ones(len(x), dtype=np.float64), x])
+    xtx = xmat.T @ xmat
+    reg = np.eye(2, dtype=np.float64) * max(float(ridge), 0.0)
+    try:
+        beta = np.linalg.solve(xtx + reg, xmat.T @ y)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(beta)):
+        return None
+    return beta.astype(np.float64)
+
+
+def _garch_iv_surface_nextday_forecast(
+    *,
+    iv_surface_obs: np.ndarray,
+    asset_ids: np.ndarray,
+    forecast_entry_idx: np.ndarray,
+    train_date_mask: np.ndarray,
+    tenor_days: np.ndarray,
+    min_history: int = 60,
+) -> tuple[np.ndarray, dict[str, float | int | str]]:
+    """ARX(1)-GARCH(1,1) baseline on log ATM IV with deterministic surface mapping."""
+    nx = int(iv_surface_obs.shape[1])
+    nt = int(iv_surface_obs.shape[2])
+    if len(forecast_entry_idx) == 0:
+        return np.empty((0, nx, nt), dtype=np.float32), {
+            "family": "arx1_garch11_atm_surface_linear",
+            "trained_assets": 0,
+            "min_history": int(max(20, min_history)),
+            "fallback_persistence_days": 0,
+        }
+
+    min_history = int(max(20, min_history))
+    preds = iv_surface_obs[forecast_entry_idx].astype(np.float64).copy()  # persistence fallback
+    fallback_days = int(len(forecast_entry_idx))
+    trained_assets = 0
+    entry_pos = {int(e): i for i, e in enumerate(forecast_entry_idx)}
+
+    t_mid = int(np.argmin(np.abs(np.asarray(tenor_days, dtype=np.float64) - 30.0)))
+    x_atm = int(nx // 2)
+    level_series = np.log(np.clip(iv_surface_obs[:, x_atm, t_mid].astype(np.float64), 1e-6, None))
+
+    train_mask = np.asarray(train_date_mask, dtype=bool).reshape(-1)
+    if len(train_mask) != len(level_series):
+        train_mask = np.zeros(len(level_series), dtype=bool)
+
+    unique_assets = np.unique(asset_ids.astype(np.int32))
+    for aid in unique_assets:
+        seq = np.where(asset_ids == aid)[0]
+        if len(seq) < min_history + 1:
+            continue
+
+        seq = np.sort(seq.astype(np.int64))
+        y_asset = level_series[seq].astype(np.float64)
+        iv_asset = iv_surface_obs[seq].astype(np.float64)
+        local_train_pairs = np.where(train_mask[seq[:-1]] & train_mask[seq[1:]])[0].astype(np.int64)
+        if len(local_train_pairs) < min_history:
+            continue
+
+        train_rows = np.where(train_mask[seq])[0].astype(np.int64)
+        if len(train_rows) < min_history + 1:
+            continue
+        y_train = y_asset[train_rows]
+        c, phi, resid = _fit_ar1_coeffs(y_train)
+        omega, alpha, beta = _fit_garch11_gaussian_qmle(resid)
+
+        # Build filtered conditional variances and standardized-residual AR(1) shock memory.
+        h_train, var0 = _garch11_filter_variance(
+            resid,
+            omega=omega,
+            alpha=alpha,
+            beta=beta,
+        )
+        z_train = resid / np.sqrt(np.clip(h_train, 1e-10, None))
+        z_train = np.nan_to_num(z_train, nan=0.0, posinf=0.0, neginf=0.0)
+        rho = _fit_ar1_no_intercept(z_train)
+
+        resid_full = y_asset[1:] - (c + phi * y_asset[:-1])
+        resid_full = np.nan_to_num(resid_full, nan=0.0, posinf=0.0, neginf=0.0)
+        h_full, _ = _garch11_filter_variance(
+            resid_full,
+            omega=omega,
+            alpha=alpha,
+            beta=beta,
+        )
+
+        beta_surface = _fit_surface_logret_linear_map(
+            iv_asset=iv_asset,
+            atm_log_series=y_asset,
+            pair_pos=local_train_pairs,
+            ridge=1e-6,
+        )
+        idx_to_local = {int(gidx): int(i) for i, gidx in enumerate(seq)}
+
+        entries = forecast_entry_idx[asset_ids[forecast_entry_idx] == aid]
+        if len(entries) == 0:
+            continue
+
+        assigned = 0
+        for e in entries:
+            pos = entry_pos.get(int(e))
+            if pos is None:
+                continue
+            local_i = idx_to_local.get(int(e))
+            if local_i is None or local_i >= len(seq) - 1:
+                continue
+
+            y_t = float(y_asset[local_i])
+            mu_next = float(c + phi * y_t)
+            if not np.isfinite(mu_next):
+                continue
+
+            if local_i <= 0:
+                e_t = 0.0
+                h_t = var0
+            else:
+                e_t = float(resid_full[local_i - 1]) if (local_i - 1) < len(resid_full) else 0.0
+                h_t = float(h_full[local_i - 1]) if (local_i - 1) < len(h_full) else var0
+            if (not np.isfinite(h_t)) or h_t <= 1e-12:
+                h_t = var0
+
+            h_next = float(omega + alpha * (e_t * e_t) + beta * h_t)
+            if (not np.isfinite(h_next)) or h_next <= 1e-12:
+                h_next = max(var0, 1e-10)
+            z_t = float(e_t / np.sqrt(max(h_t, 1e-10)))
+            shock_next = float(np.clip(rho * z_t, -3.0, 3.0) * np.sqrt(max(h_next, 1e-10)))
+
+            y_next_pred = float(mu_next + shock_next)
+            if not np.isfinite(y_next_pred):
+                continue
+            delta_atm = float(np.clip(y_next_pred - y_t, -1.0, 1.0))
+
+            iv_now = np.clip(iv_surface_obs[int(e)].astype(np.float64), 1e-6, None)
+            if beta_surface is None:
+                log_ret = np.full(nx * nt, delta_atm, dtype=np.float64)
+            else:
+                log_ret = beta_surface[0] + beta_surface[1] * delta_atm
+            log_ret = np.clip(log_ret, -1.2, 1.2)
+            pred = np.clip(iv_now.reshape(-1) * np.exp(log_ret), 1e-4, 4.0).reshape(nx, nt)
+            preds[pos] = pred.astype(np.float64)
+            assigned += 1
+
+        if assigned > 0:
+            trained_assets += 1
+            fallback_days -= assigned
+
+    fallback_days = int(max(0, fallback_days))
+    return preds.astype(np.float32), {
+        "family": "arx1_garch11_atm_surface_linear",
+        "trained_assets": int(trained_assets),
+        "min_history": int(min_history),
+        "fallback_persistence_days": int(fallback_days),
+    }
+
+
 def _parametric_factor_har_forecast(
     iv_surface_obs: np.ndarray,
     forecast_entry_idx: np.ndarray,
@@ -666,6 +962,9 @@ def evaluate(
     baseline_factor_dim: int = 3,
     baseline_ridge: float = 1e-4,
     baseline_min_history: int = 40,
+    enable_tree_baseline: bool = False,
+    enable_garch_baseline: bool = False,
+    garch_min_history: int = 60,
     tree_baseline_strict: bool = True,
 ) -> Path:
     run_dir = run_dir.resolve()
@@ -970,6 +1269,7 @@ def evaluate(
     metrics["surface_forecast_days"] = int(len(forecast_entry_idx))
     base_forecast_persistence = np.empty((0, *iv_surface_obs.shape[1:]), dtype=np.float32)
     base_forecast_tree = np.empty((0, *iv_surface_obs.shape[1:]), dtype=np.float32)
+    base_forecast_garch = np.empty((0, *iv_surface_obs.shape[1:]), dtype=np.float32)
     base_forecast_param = np.empty((0, *iv_surface_obs.shape[1:]), dtype=np.float32)
     forecast_err_by_dte = pd.DataFrame()
     forecast_err_by_moneyness = pd.DataFrame()
@@ -985,41 +1285,73 @@ def evaluate(
         metrics["surface_forecast_iv_rmse_baseline_persistence"] = rmse(base_forecast_persistence, obs_forecast)
         metrics["surface_forecast_iv_mae_baseline_persistence"] = mae(base_forecast_persistence, obs_forecast)
 
-        # Replacement baseline: tree-boosted next-day surface mapping trained on train+val only.
-        if tree_baseline_strict and HistGradientBoostingRegressor is None:
-            raise RuntimeError(
-                "Tree baseline is unavailable because scikit-learn (HistGradientBoostingRegressor) "
-                "could not be imported in the active environment. "
-                "Install it in this env, e.g. `.venv/bin/python -m pip install scikit-learn`."
-            )
+        # Optional non-persistence baselines (disabled by default).
         train_val_mask = np.zeros(int(n_dates), dtype=bool)
         train_val_mask[np.setdiff1d(np.arange(n_dates), test_dates)] = True
-        base_forecast_tree, tree_meta = _tree_boost_surface_nextday_forecast(
-            iv_surface_obs=iv_surface_obs,
-            context_scaled=context_scaled,
-            asset_ids=asset_ids,
-            forecast_entry_idx=forecast_entry_idx,
-            x_grid=x_grid,
-            tenor_days=tenor_days,
-            train_date_mask=train_val_mask,
-            min_history=int(max(60, baseline_min_history)),
-        )
-        if tree_baseline_strict and int(tree_meta.get("trained_assets", 0)) <= 0:
-            raise RuntimeError(
-                "Tree baseline produced no trained assets and would fall back entirely to persistence. "
-                "Refusing to continue in strict mode to avoid silent fallback."
+        tree_meta: dict[str, float | int | str] = {
+            "family": (
+                "hist_gradient_boosting_surface_pca"
+                if HistGradientBoostingRegressor is not None
+                else "hist_gradient_boosting_unavailable"
+            ),
+            "trained_assets": 0,
+            "min_history": int(max(60, baseline_min_history)),
+            "fallback_persistence_days": int(len(forecast_entry_idx)),
+        }
+        if bool(enable_tree_baseline):
+            if tree_baseline_strict and HistGradientBoostingRegressor is None:
+                raise RuntimeError(
+                    "Tree baseline is unavailable because scikit-learn (HistGradientBoostingRegressor) "
+                    "could not be imported in the active environment. "
+                    "Install it in this env, e.g. `.venv/bin/python -m pip install scikit-learn`."
+                )
+            base_forecast_tree, tree_meta = _tree_boost_surface_nextday_forecast(
+                iv_surface_obs=iv_surface_obs,
+                context_scaled=context_scaled,
+                asset_ids=asset_ids,
+                forecast_entry_idx=forecast_entry_idx,
+                x_grid=x_grid,
+                tenor_days=tenor_days,
+                train_date_mask=train_val_mask,
+                min_history=int(max(60, baseline_min_history)),
             )
-        metrics["surface_forecast_baseline_primary"] = "tree_boost_surface_nextday"
-        metrics["surface_forecast_baseline_tree_family"] = str(tree_meta.get("family", "tree_boost_surface_nextday"))
-        metrics["surface_forecast_baseline_tree_trained_assets"] = int(tree_meta.get("trained_assets", 0))
-        metrics["surface_forecast_baseline_tree_min_history"] = int(tree_meta.get("min_history", 0))
-        metrics["surface_forecast_baseline_tree_fallback_days"] = int(tree_meta.get("fallback_persistence_days", 0))
-        metrics["surface_forecast_iv_rmse_baseline_tree"] = rmse(base_forecast_tree, obs_forecast)
-        metrics["surface_forecast_iv_mae_baseline_tree"] = mae(base_forecast_tree, obs_forecast)
+            if tree_baseline_strict and int(tree_meta.get("trained_assets", 0)) <= 0:
+                raise RuntimeError(
+                    "Tree baseline produced no trained assets and would fall back entirely to persistence. "
+                    "Refusing to continue in strict mode to avoid silent fallback."
+                )
+            metrics["surface_forecast_iv_rmse_baseline_tree"] = rmse(base_forecast_tree, obs_forecast)
+            metrics["surface_forecast_iv_mae_baseline_tree"] = mae(base_forecast_tree, obs_forecast)
+        else:
+            base_forecast_tree = np.full_like(base_forecast_persistence, np.nan, dtype=np.float32)
+            metrics["surface_forecast_iv_rmse_baseline_tree"] = float("nan")
+            metrics["surface_forecast_iv_mae_baseline_tree"] = float("nan")
 
-        # Parametric baseline is not computed in this pipeline variant.
+        garch_meta: dict[str, float | int | str] = {
+            "family": "arx1_garch11_atm_surface_linear",
+            "trained_assets": 0,
+            "min_history": int(max(20, garch_min_history)),
+            "fallback_persistence_days": int(len(forecast_entry_idx)),
+        }
+        if bool(enable_garch_baseline):
+            base_forecast_garch, garch_meta = _garch_iv_surface_nextday_forecast(
+                iv_surface_obs=iv_surface_obs,
+                asset_ids=asset_ids,
+                forecast_entry_idx=forecast_entry_idx,
+                train_date_mask=train_val_mask,
+                tenor_days=tenor_days,
+                min_history=int(max(20, garch_min_history)),
+            )
+            metrics["surface_forecast_iv_rmse_baseline_garch"] = rmse(base_forecast_garch, obs_forecast)
+            metrics["surface_forecast_iv_mae_baseline_garch"] = mae(base_forecast_garch, obs_forecast)
+        else:
+            base_forecast_garch = np.full_like(base_forecast_persistence, np.nan, dtype=np.float32)
+            metrics["surface_forecast_iv_rmse_baseline_garch"] = float("nan")
+            metrics["surface_forecast_iv_mae_baseline_garch"] = float("nan")
+
+        # Parametric baseline is intentionally disabled in this pipeline variant.
         base_forecast_param = np.full_like(base_forecast_tree, np.nan, dtype=np.float32)
-        metrics["surface_forecast_baseline_parametric_family"] = "not_computed_replaced_by_tree"
+        metrics["surface_forecast_baseline_parametric_family"] = "disabled"
         metrics["surface_forecast_baseline_parametric_factors"] = 0
         metrics["surface_forecast_baseline_parametric_ridge"] = float("nan")
         metrics["surface_forecast_baseline_parametric_min_history"] = 0
@@ -1028,23 +1360,48 @@ def evaluate(
         metrics["surface_forecast_iv_rmse_baseline_parametric"] = float("nan")
         metrics["surface_forecast_iv_mae_baseline_parametric"] = float("nan")
 
+        metrics["surface_forecast_baseline_tree_family"] = str(tree_meta.get("family", "tree_boost_surface_nextday"))
+        metrics["surface_forecast_baseline_tree_trained_assets"] = int(tree_meta.get("trained_assets", 0))
+        metrics["surface_forecast_baseline_tree_min_history"] = int(tree_meta.get("min_history", 0))
+        metrics["surface_forecast_baseline_tree_fallback_days"] = int(tree_meta.get("fallback_persistence_days", 0))
+        metrics["surface_forecast_baseline_tree_enabled"] = bool(enable_tree_baseline)
+
+        metrics["surface_forecast_baseline_garch_family"] = str(garch_meta.get("family", "arx1_garch11_atm_surface_linear"))
+        metrics["surface_forecast_baseline_garch_trained_assets"] = int(garch_meta.get("trained_assets", 0))
+        metrics["surface_forecast_baseline_garch_min_history"] = int(garch_meta.get("min_history", 0))
+        metrics["surface_forecast_baseline_garch_fallback_days"] = int(garch_meta.get("fallback_persistence_days", 0))
+        metrics["surface_forecast_baseline_garch_enabled"] = bool(enable_garch_baseline)
+
         mse_model = float(np.mean((pred_forecast - obs_forecast) ** 2))
         mse_base_persistence = float(np.mean((base_forecast_persistence - obs_forecast) ** 2))
-        mse_base_tree = float(np.mean((base_forecast_tree - obs_forecast) ** 2))
+        mse_base_tree = float(np.mean((base_forecast_tree - obs_forecast) ** 2)) if bool(enable_tree_baseline) else float("nan")
+        mse_base_garch = float(np.mean((base_forecast_garch - obs_forecast) ** 2)) if bool(enable_garch_baseline) else float("nan")
         metrics["surface_forecast_skill_mse_vs_persistence"] = (
             float(1.0 - (mse_model / mse_base_persistence)) if mse_base_persistence > 0 else float("nan")
         )
         metrics["surface_forecast_skill_mse_vs_tree"] = (
             float(1.0 - (mse_model / mse_base_tree)) if mse_base_tree > 0 else float("nan")
         )
+        metrics["surface_forecast_skill_mse_vs_garch"] = (
+            float(1.0 - (mse_model / mse_base_garch)) if mse_base_garch > 0 else float("nan")
+        )
         metrics["surface_forecast_skill_mse_vs_parametric"] = float("nan")
+
+        if bool(enable_tree_baseline):
+            metrics["surface_forecast_baseline_primary"] = "tree_boost_surface_nextday"
+        elif bool(enable_garch_baseline):
+            metrics["surface_forecast_baseline_primary"] = "garch_ar1_surface"
+        else:
+            metrics["surface_forecast_baseline_primary"] = "persistence_reference_only"
+
         forecast_err_by_dte, forecast_err_by_moneyness, forecast_err_grid = _surface_forecast_error_profiles(
             obs_forecast=obs_forecast.astype(np.float32),
             pred_forecast=pred_forecast.astype(np.float32),
             x_grid=x_grid.astype(np.float32),
             tenor_days=tenor_days.astype(np.int32),
             persistence_forecast=base_forecast_persistence.astype(np.float32),
-            tree_forecast=base_forecast_tree.astype(np.float32),
+            tree_forecast=(base_forecast_tree.astype(np.float32) if bool(enable_tree_baseline) else None),
+            garch_forecast=(base_forecast_garch.astype(np.float32) if bool(enable_garch_baseline) else None),
         )
     else:
         metrics["surface_forecast_iv_rmse"] = float("nan")
@@ -1055,17 +1412,26 @@ def evaluate(
         metrics["surface_forecast_iv_rmse_baseline_tree"] = float("nan")
         metrics["surface_forecast_iv_mae_baseline_tree"] = float("nan")
         metrics["surface_forecast_skill_mse_vs_tree"] = float("nan")
+        metrics["surface_forecast_iv_rmse_baseline_garch"] = float("nan")
+        metrics["surface_forecast_iv_mae_baseline_garch"] = float("nan")
+        metrics["surface_forecast_skill_mse_vs_garch"] = float("nan")
         metrics["surface_forecast_baseline_tree_family"] = (
             "hist_gradient_boosting_surface_pca" if HistGradientBoostingRegressor is not None else "hist_gradient_boosting_unavailable"
         )
         metrics["surface_forecast_baseline_tree_trained_assets"] = 0
         metrics["surface_forecast_baseline_tree_min_history"] = int(max(60, baseline_min_history))
         metrics["surface_forecast_baseline_tree_fallback_days"] = 0
+        metrics["surface_forecast_baseline_tree_enabled"] = bool(enable_tree_baseline)
+        metrics["surface_forecast_baseline_garch_family"] = "arx1_garch11_atm_surface_linear"
+        metrics["surface_forecast_baseline_garch_trained_assets"] = 0
+        metrics["surface_forecast_baseline_garch_min_history"] = int(max(20, garch_min_history))
+        metrics["surface_forecast_baseline_garch_fallback_days"] = 0
+        metrics["surface_forecast_baseline_garch_enabled"] = bool(enable_garch_baseline)
         metrics["surface_forecast_iv_rmse_baseline_parametric"] = float("nan")
         metrics["surface_forecast_iv_mae_baseline_parametric"] = float("nan")
         metrics["surface_forecast_skill_mse_vs_parametric"] = float("nan")
-        metrics["surface_forecast_baseline_primary"] = "tree_boost_surface_nextday"
-        metrics["surface_forecast_baseline_parametric_family"] = "not_computed_replaced_by_tree"
+        metrics["surface_forecast_baseline_primary"] = "persistence_reference_only"
+        metrics["surface_forecast_baseline_parametric_family"] = "disabled"
         metrics["surface_forecast_baseline_parametric_factors"] = 0
         metrics["surface_forecast_baseline_parametric_ridge"] = float("nan")
         metrics["surface_forecast_baseline_parametric_min_history"] = 0
@@ -1132,7 +1498,7 @@ def evaluate(
         metrics["butterfly_violation_forecast_pred_mean"] = float(np.mean(bfly_pred_f)) if len(bfly_pred_f) else float("nan")
 
         # Tree-baseline no-arbitrage diagnostics on the same forecast targets.
-        if len(base_forecast_tree) == len(forecast_entry_idx):
+        if bool(enable_tree_baseline) and len(base_forecast_tree) == len(forecast_entry_idx):
             rows_tree_f = [
                 _noarb_for_day(obs_forecast[i], base_forecast_tree[i], x_grid, tenor_days) for i in range(len(forecast_entry_idx))
             ]
@@ -1276,6 +1642,7 @@ def evaluate(
         iv_surface_forecast=forecast_iv.astype(np.float32),
         iv_surface_forecast_baseline_persistence=base_forecast_persistence.astype(np.float32),
         iv_surface_forecast_baseline_tree=base_forecast_tree.astype(np.float32),
+        iv_surface_forecast_baseline_garch=base_forecast_garch.astype(np.float32),
         iv_surface_forecast_baseline_parametric=base_forecast_param.astype(np.float32),
         x_grid=x_grid,
         tenor_days=tenor_days,

@@ -444,6 +444,8 @@ def _to_float(v: Any) -> float | None:
 def _with_tree_noarb_fallback(metrics: dict[str, Any], run_dir: Path | None = None) -> dict[str, Any]:
     if not metrics:
         return metrics
+    if not bool(metrics.get("surface_forecast_baseline_tree_enabled", False)):
+        return metrics
 
     cal_tree = _to_float(metrics.get("calendar_violation_forecast_tree_mean"))
     bfly_tree = _to_float(metrics.get("butterfly_violation_forecast_tree_mean"))
@@ -514,6 +516,10 @@ def _baseline_label_from_key(key: str) -> str:
     s = str(key).strip().lower()
     if s == "tree":
         return "Tree Baseline"
+    if s == "garch":
+        return "GARCH Baseline"
+    if s == "persistence":
+        return "Persistence"
     return "Parametric Factor-HAR(1,5,22)"
 
 
@@ -523,32 +529,51 @@ def _resolve_primary_non_persistence_baseline(metrics: dict[str, Any]) -> dict[s
         "tree": {
             "key": "tree",
             "rmse_key": "surface_forecast_iv_rmse_baseline_tree",
+            "mae_key": "surface_forecast_iv_mae_baseline_tree",
             "skill_key": "surface_forecast_skill_mse_vs_tree",
+        },
+        "garch": {
+            "key": "garch",
+            "rmse_key": "surface_forecast_iv_rmse_baseline_garch",
+            "mae_key": "surface_forecast_iv_mae_baseline_garch",
+            "skill_key": "surface_forecast_skill_mse_vs_garch",
         },
         "parametric": {
             "key": "parametric",
             "rmse_key": "surface_forecast_iv_rmse_baseline_parametric",
+            "mae_key": "surface_forecast_iv_mae_baseline_parametric",
             "skill_key": "surface_forecast_skill_mse_vs_parametric",
+        },
+        "persistence": {
+            "key": "persistence",
+            "rmse_key": "surface_forecast_iv_rmse_baseline_persistence",
+            "mae_key": "surface_forecast_iv_mae_baseline_persistence",
+            "skill_key": "surface_forecast_skill_mse_vs_persistence",
         },
     }
     if "tree" in primary_raw:
-        order = ["tree", "parametric"]
+        order = ["tree", "garch", "parametric"]
+    elif "garch" in primary_raw:
+        order = ["garch", "tree", "parametric"]
     elif "param" in primary_raw or "har" in primary_raw:
-        order = ["parametric", "tree"]
+        order = ["parametric", "tree", "garch"]
+    elif "persistence" in primary_raw:
+        order = ["persistence", "tree", "garch", "parametric"]
     else:
-        order = ["tree", "parametric"]
+        order = ["tree", "garch", "parametric", "persistence"]
 
     for k in order:
         spec = specs[k]
         rmse = _to_float(metrics.get(spec["rmse_key"]))
+        mae_v = _to_float(metrics.get(spec["mae_key"]))
         skill = _to_float(metrics.get(spec["skill_key"]))
-        if rmse is not None or skill is not None:
+        if rmse is not None or mae_v is not None or skill is not None:
             out = dict(spec)
             out["label"] = _baseline_label_from_key(k)
             return out
 
-    # Fall back to declared primary even if values are missing.
-    k = order[0]
+    # Fall back to persistence if no non-persistence baseline is available.
+    k = "persistence"
     out = dict(specs[k])
     out["label"] = _baseline_label_from_key(k)
     return out
@@ -559,7 +584,12 @@ def _resolve_primary_skill(metrics: dict[str, Any]) -> float | None:
     skill = _to_float(metrics.get(primary["skill_key"]))
     if skill is not None:
         return skill
-    for key in ("surface_forecast_skill_mse_vs_tree", "surface_forecast_skill_mse_vs_parametric", "surface_forecast_skill_mse_vs_persistence"):
+    for key in (
+        "surface_forecast_skill_mse_vs_tree",
+        "surface_forecast_skill_mse_vs_garch",
+        "surface_forecast_skill_mse_vs_parametric",
+        "surface_forecast_skill_mse_vs_persistence",
+    ):
         skill = _to_float(metrics.get(key))
         if skill is not None:
             return skill
@@ -569,11 +599,17 @@ def _resolve_primary_skill(metrics: dict[str, Any]) -> float | None:
 def _baseline_comparison_specs(metrics: dict[str, Any]) -> list[dict[str, Any]]:
     primary = _resolve_primary_non_persistence_baseline(metrics)
     primary_label = str(primary.get("label", "Primary Baseline"))
-    return [
+    specs = [
         {
             "factor": f"Surface Forecast RMSE vs {primary_label}",
             "model_key": "surface_forecast_iv_rmse",
             "baseline_key": str(primary["rmse_key"]),
+            "better": "lower",
+        },
+        {
+            "factor": f"Surface Forecast MAE vs {primary_label}",
+            "model_key": "surface_forecast_iv_mae",
+            "baseline_key": str(primary["mae_key"]),
             "better": "lower",
         },
         {
@@ -588,7 +624,16 @@ def _baseline_comparison_specs(metrics: dict[str, Any]) -> list[dict[str, Any]]:
             "baseline_key": "surface_forecast_iv_rmse_baseline_persistence",
             "better": "lower",
         },
+        {
+            "factor": "Surface Forecast MAE vs Persistence (reference)",
+            "model_key": "surface_forecast_iv_mae",
+            "baseline_key": "surface_forecast_iv_mae_baseline_persistence",
+            "better": "lower",
+        },
     ]
+    if str(primary.get("key", "")) == "persistence":
+        specs = [s for s in specs if "Persistence (reference)" not in str(s.get("factor", ""))]
+    return specs
 
 
 def _build_baseline_comparison_df(metrics: dict[str, Any]) -> pd.DataFrame:
@@ -621,6 +666,12 @@ def _build_direct_baseline_value_df(metrics: dict[str, Any]) -> pd.DataFrame:
             "model_key": "surface_forecast_iv_rmse",
             "primary_key": str(primary["rmse_key"]),
             "persistence_key": "surface_forecast_iv_rmse_baseline_persistence",
+        },
+        {
+            "metric": "Surface Forecast MAE",
+            "model_key": "surface_forecast_iv_mae",
+            "primary_key": str(primary["mae_key"]),
+            "persistence_key": "surface_forecast_iv_mae_baseline_persistence",
         },
     ]
     rows: list[dict[str, Any]] = []
@@ -728,6 +779,12 @@ def _render_baseline_cards(metrics: dict[str, Any]) -> None:
             "better": "lower",
         },
         {
+            "label": f"Surface Forecast MAE vs {primary_label}",
+            "model_key": "surface_forecast_iv_mae",
+            "baseline_key": str(primary["mae_key"]),
+            "better": "lower",
+        },
+        {
             "label": f"Surface Forecast Skill vs {primary_label}",
             "model_key": str(primary["skill_key"]),
             "baseline_value": 0.0,
@@ -739,7 +796,15 @@ def _render_baseline_cards(metrics: dict[str, Any]) -> None:
             "baseline_key": "surface_forecast_iv_rmse_baseline_persistence",
             "better": "lower",
         },
+        {
+            "label": "Surface Forecast MAE vs Persistence",
+            "model_key": "surface_forecast_iv_mae",
+            "baseline_key": "surface_forecast_iv_mae_baseline_persistence",
+            "better": "lower",
+        },
     ]
+    if str(primary.get("key", "")) == "persistence":
+        cards = [c for c in cards if not str(c.get("label", "")).endswith("vs Persistence")]
     cols = st.columns(len(cards))
     for i, spec in enumerate(cards):
         model_value = _to_float(metrics.get(spec["model_key"]))
@@ -778,6 +843,20 @@ def _render_baseline_sections(metrics: dict[str, Any], run_dir: Path | None = No
             "Primary baseline: "
             f"`{baseline_primary}` | family=`{baseline_family}` | trained_assets={baseline_trained} | "
             f"min_history={baseline_min_history} | persistence fallback days={baseline_fallback}"
+        )
+    elif primary_key == "garch":
+        baseline_family = str(metrics.get("surface_forecast_baseline_garch_family", "n/a"))
+        baseline_trained = _format_value(metrics.get("surface_forecast_baseline_garch_trained_assets"), 0)
+        baseline_min_history = _format_value(metrics.get("surface_forecast_baseline_garch_min_history"), 0)
+        baseline_fallback = _format_value(metrics.get("surface_forecast_baseline_garch_fallback_days"), 0)
+        st.caption(
+            "Primary baseline: "
+            f"`{baseline_primary}` | family=`{baseline_family}` | trained_assets={baseline_trained} | "
+            f"min_history={baseline_min_history} | persistence fallback days={baseline_fallback}"
+        )
+    elif primary_key == "persistence":
+        st.caption(
+            "Primary baseline: `persistence_reference_only` | non-persistence baselines are disabled for this evaluation run."
         )
     else:
         baseline_family = str(metrics.get("surface_forecast_baseline_parametric_family", "n/a"))
@@ -862,10 +941,15 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
 
         primary = _resolve_primary_non_persistence_baseline(metrics)
         surf_rmse = _to_float(metrics.get("surface_forecast_iv_rmse"))
+        surf_mae = _to_float(metrics.get("surface_forecast_iv_mae"))
         surf_base_primary = _to_float(metrics.get(primary["rmse_key"]))
         surf_edge_primary, _ = _edge_vs_baseline(surf_rmse, surf_base_primary, better="lower")
         surf_base_persistence = _to_float(metrics.get("surface_forecast_iv_rmse_baseline_persistence"))
         surf_edge_persistence, _ = _edge_vs_baseline(surf_rmse, surf_base_persistence, better="lower")
+        surf_base_primary_mae = _to_float(metrics.get(primary["mae_key"]))
+        surf_edge_primary_mae, _ = _edge_vs_baseline(surf_mae, surf_base_primary_mae, better="lower")
+        surf_base_persistence_mae = _to_float(metrics.get("surface_forecast_iv_mae_baseline_persistence"))
+        surf_edge_persistence_mae, _ = _edge_vs_baseline(surf_mae, surf_base_persistence_mae, better="lower")
 
         cal_obs_f = _to_float(metrics.get("calendar_violation_forecast_obs_mean"))
         cal_pred_f = _to_float(metrics.get("calendar_violation_forecast_pred_mean"))
@@ -886,6 +970,7 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
                 "Primary baseline label": str(primary.get("label", "Primary Baseline")),
                 "Forecast skill vs primary": _to_float(metrics.get(primary["skill_key"])),
                 "Forecast skill vs tree": _to_float(metrics.get("surface_forecast_skill_mse_vs_tree")),
+                "Forecast skill vs garch": _to_float(metrics.get("surface_forecast_skill_mse_vs_garch")),
                 "Forecast skill vs parametric": _to_float(metrics.get("surface_forecast_skill_mse_vs_parametric")),
                 "Forecast skill vs persistence": _to_float(metrics.get("surface_forecast_skill_mse_vs_persistence")),
                 "Surface RMSE": surf_rmse,
@@ -893,6 +978,11 @@ def _build_all_symbols_baseline_snapshot(latest_runs_by_symbol: dict[str, Path])
                 "Surface edge (vs primary)": surf_edge_primary,
                 "Surface RMSE baseline (persistence)": surf_base_persistence,
                 "Surface edge (vs persistence)": surf_edge_persistence,
+                "Surface MAE": surf_mae,
+                "Surface MAE baseline (primary)": surf_base_primary_mae,
+                "Surface MAE edge (vs primary)": surf_edge_primary_mae,
+                "Surface MAE baseline (persistence)": surf_base_persistence_mae,
+                "Surface MAE edge (vs persistence)": surf_edge_persistence_mae,
                 "Forecast calendar abs gap (model)": cal_gap_model,
                 "Forecast calendar abs gap (tree)": cal_gap_tree,
                 "Forecast calendar edge vs tree (gap)": (
@@ -929,7 +1019,12 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
 
     bar_df = snap.melt(
         id_vars=["Symbol"],
-        value_vars=["Surface edge (vs primary)", "Surface edge (vs persistence)"],
+        value_vars=[
+            "Surface edge (vs primary)",
+            "Surface edge (vs persistence)",
+            "Surface MAE edge (vs primary)",
+            "Surface MAE edge (vs persistence)",
+        ],
         var_name="Series",
         value_name="Edge",
     )
@@ -941,7 +1036,7 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
             .encode(
                 x=alt.X("Symbol:N", title="Symbol"),
                 xOffset=alt.XOffset("Series:N"),
-                y=alt.Y("Edge:Q", title="Surface RMSE edge (positive is better)"),
+                y=alt.Y("Edge:Q", title="Surface edge (positive is better)"),
                 color=alt.Color("Series:N", title="Series"),
                 tooltip=["Symbol:N", "Series:N", alt.Tooltip("Edge:Q", format=".6f")],
             )
@@ -954,6 +1049,7 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
         "Primary baseline label",
         "Forecast skill vs primary",
         "Forecast skill vs tree",
+        "Forecast skill vs garch",
         "Forecast skill vs parametric",
         "Forecast skill vs persistence",
         "Surface RMSE",
@@ -961,6 +1057,11 @@ def _render_baseline_comparison_tab(run_dir: Path, latest_runs_by_symbol: dict[s
         "Surface edge (vs primary)",
         "Surface RMSE baseline (persistence)",
         "Surface edge (vs persistence)",
+        "Surface MAE",
+        "Surface MAE baseline (primary)",
+        "Surface MAE edge (vs primary)",
+        "Surface MAE baseline (persistence)",
+        "Surface MAE edge (vs persistence)",
         "Forecast calendar abs gap (model)",
         "Forecast calendar abs gap (tree)",
         "Forecast calendar edge vs tree (gap)",
@@ -1472,6 +1573,7 @@ def _render_surface_forecast_diagnostics(eval_dir: Path) -> None:
     primary = _resolve_primary_non_persistence_baseline(metrics)
     baseline_label = str(primary.get("label", "persistence"))
     base_tree = None
+    base_garch = None
     base_param = None
     if "iv_surface_forecast_baseline_tree" in payload.files:
         raw_tree = payload["iv_surface_forecast_baseline_tree"].astype(np.float32)
@@ -1481,15 +1583,24 @@ def _render_surface_forecast_diagnostics(eval_dir: Path) -> None:
         raw_param = payload["iv_surface_forecast_baseline_parametric"].astype(np.float32)
         if len(raw_param) == len(entry_idx):
             base_param = raw_param
+    if "iv_surface_forecast_baseline_garch" in payload.files:
+        raw_garch = payload["iv_surface_forecast_baseline_garch"].astype(np.float32)
+        if len(raw_garch) == len(entry_idx):
+            base_garch = raw_garch
 
     primary_key = str(primary.get("key", "parametric"))
     if primary_key == "tree" and base_tree is not None:
         base_primary = base_tree
+    elif primary_key == "garch" and base_garch is not None:
+        base_primary = base_garch
     elif primary_key == "parametric" and base_param is not None:
         base_primary = base_param
     elif base_tree is not None:
         base_primary = base_tree
         baseline_label = "Tree Baseline"
+    elif base_garch is not None:
+        base_primary = base_garch
+        baseline_label = "GARCH Baseline"
     elif base_param is not None:
         base_primary = base_param
         baseline_label = "Parametric Factor-HAR(1,5,22)"
@@ -1498,13 +1609,24 @@ def _render_surface_forecast_diagnostics(eval_dir: Path) -> None:
         baseline_label = "Persistence"
 
     model_rmse = np.sqrt(np.mean((pred - truth) ** 2, axis=(1, 2)))
+    model_mae = np.mean(np.abs(pred - truth), axis=(1, 2))
     base_rmse_persistence = np.sqrt(np.mean((base_persistence - truth) ** 2, axis=(1, 2)))
+    base_mae_persistence = np.mean(np.abs(base_persistence - truth), axis=(1, 2))
     tree_rmse = None
+    tree_mae = None
+    garch_rmse = None
+    garch_mae = None
     parametric_rmse = None
+    parametric_mae = None
     if base_tree is not None:
         tree_rmse = np.sqrt(np.mean((base_tree - truth) ** 2, axis=(1, 2)))
+        tree_mae = np.mean(np.abs(base_tree - truth), axis=(1, 2))
+    if base_garch is not None:
+        garch_rmse = np.sqrt(np.mean((base_garch - truth) ** 2, axis=(1, 2)))
+        garch_mae = np.mean(np.abs(base_garch - truth), axis=(1, 2))
     if base_param is not None:
         parametric_rmse = np.sqrt(np.mean((base_param - truth) ** 2, axis=(1, 2)))
+        parametric_mae = np.mean(np.abs(base_param - truth), axis=(1, 2))
     model_mse = np.mean((pred - truth) ** 2, axis=(1, 2))
     base_mse = np.mean((base_primary - truth) ** 2, axis=(1, 2))
     skill = np.full_like(model_mse, np.nan, dtype=np.float64)
@@ -1515,20 +1637,39 @@ def _render_surface_forecast_diagnostics(eval_dir: Path) -> None:
         "date_entry": dates[entry_idx],
         "date_target": dates[target_idx],
         "model_rmse": model_rmse,
+        "model_mae": model_mae,
         "persistence_rmse": base_rmse_persistence,
+        "persistence_mae": base_mae_persistence,
         "skill_vs_primary_baseline": skill,
     }
     if tree_rmse is not None:
         day_payload["tree_rmse"] = tree_rmse
+    if tree_mae is not None:
+        day_payload["tree_mae"] = tree_mae
+    if garch_rmse is not None:
+        day_payload["garch_rmse"] = garch_rmse
+    if garch_mae is not None:
+        day_payload["garch_mae"] = garch_mae
     if base_param is not None:
         day_payload["parametric_rmse"] = parametric_rmse
+    if parametric_mae is not None:
+        day_payload["parametric_mae"] = parametric_mae
     day_df = pd.DataFrame(day_payload)
 
     rmse_series = ["model_rmse", "persistence_rmse"]
+    mae_series = ["model_mae", "persistence_mae"]
     if "tree_rmse" in day_df.columns:
         rmse_series.append("tree_rmse")
+    if "tree_mae" in day_df.columns:
+        mae_series.append("tree_mae")
+    if "garch_rmse" in day_df.columns:
+        rmse_series.append("garch_rmse")
+    if "garch_mae" in day_df.columns:
+        mae_series.append("garch_mae")
     if "parametric_rmse" in day_df.columns:
         rmse_series.append("parametric_rmse")
+    if "parametric_mae" in day_df.columns:
+        mae_series.append("parametric_mae")
     plot_df = day_df.melt(id_vars=["date_target"], value_vars=rmse_series, var_name="series", value_name="rmse")
     rmse_chart = (
         alt.Chart(plot_df)
@@ -1542,6 +1683,20 @@ def _render_surface_forecast_diagnostics(eval_dir: Path) -> None:
         .properties(height=320)
     )
     st.altair_chart(rmse_chart, use_container_width=True)
+
+    mae_plot_df = day_df.melt(id_vars=["date_target"], value_vars=mae_series, var_name="series", value_name="mae")
+    mae_chart = (
+        alt.Chart(mae_plot_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date_target:T", title="Target date"),
+            y=alt.Y("mae:Q", title="Per-day surface forecast MAE"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=["date_target:T", "series:N", alt.Tooltip("mae:Q", format=".6f")],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(mae_chart, use_container_width=True)
 
     skill_chart = (
         alt.Chart(day_df)
@@ -1572,7 +1727,7 @@ def _render_surface_error_breakdown(eval_dir: Path) -> None:
     if not by_dte.empty:
         dte_plot = by_dte.melt(
             id_vars=["series", "dte"],
-            value_vars=["rmse"],
+            value_vars=[c for c in ("rmse", "mae") if c in by_dte.columns],
             var_name="metric",
             value_name="value",
         )
@@ -1583,20 +1738,22 @@ def _render_surface_error_breakdown(eval_dir: Path) -> None:
                 x=alt.X("dte:Q", title="DTE"),
                 y=alt.Y("value:Q", title="Absolute error"),
                 color=alt.Color("series:N", title="Series"),
-                tooltip=["series:N", "dte:Q", alt.Tooltip("value:Q", format=".6f")],
+                strokeDash=alt.StrokeDash("metric:N", title="Metric"),
+                tooltip=["series:N", "metric:N", "dte:Q", alt.Tooltip("value:Q", format=".6f")],
             )
             .properties(height=280)
         )
         st.altair_chart(chart_dte, use_container_width=True)
         show_dte = by_dte.copy()
-        for c in ("rmse",):
-            show_dte[c] = pd.to_numeric(show_dte[c], errors="coerce").round(6)
+        for c in ("rmse", "mae"):
+            if c in show_dte.columns:
+                show_dte[c] = pd.to_numeric(show_dte[c], errors="coerce").round(6)
         st.dataframe(show_dte, use_container_width=True, hide_index=True)
 
     if not by_x.empty:
         x_plot = by_x.melt(
             id_vars=["series", "moneyness_x"],
-            value_vars=["rmse"],
+            value_vars=[c for c in ("rmse", "mae") if c in by_x.columns],
             var_name="metric",
             value_name="value",
         )
@@ -1607,20 +1764,22 @@ def _render_surface_error_breakdown(eval_dir: Path) -> None:
                 x=alt.X("moneyness_x:Q", title="Moneyness x=ln(K/S)"),
                 y=alt.Y("value:Q", title="Absolute error"),
                 color=alt.Color("series:N", title="Series"),
-                tooltip=["series:N", "moneyness_x:Q", alt.Tooltip("value:Q", format=".6f")],
+                strokeDash=alt.StrokeDash("metric:N", title="Metric"),
+                tooltip=["series:N", "metric:N", "moneyness_x:Q", alt.Tooltip("value:Q", format=".6f")],
             )
             .properties(height=280)
         )
         st.altair_chart(chart_x, use_container_width=True)
         show_x = by_x.copy()
-        for c in ("rmse",):
-            show_x[c] = pd.to_numeric(show_x[c], errors="coerce").round(6)
+        for c in ("rmse", "mae"):
+            if c in show_x.columns:
+                show_x[c] = pd.to_numeric(show_x[c], errors="coerce").round(6)
         st.dataframe(show_x, use_container_width=True, hide_index=True)
 
     if not by_grid.empty:
         st.markdown("**DTE x Moneyness Heatmap**")
         series_opts = sorted(str(s) for s in by_grid["series"].dropna().astype(str).unique().tolist())
-        metric_opts = ["rmse"]
+        metric_opts = [m for m in ("rmse", "mae") if m in by_grid.columns]
         if series_opts:
             sel_series = st.selectbox("Series", options=series_opts, index=0, key="diag_grid_series")
             sel_metric = st.selectbox("Grid metric", options=metric_opts, index=0, key="diag_grid_metric")
@@ -1654,11 +1813,12 @@ def _render_eval_diagnostics(run_dir: Path) -> None:
     metrics = _read_json(eval_dir / "metrics.json")
     if metrics:
         primary_skill = _resolve_primary_skill(metrics)
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Surface Forecast RMSE", _format_value(metrics.get("surface_forecast_iv_rmse"), 6))
-        c2.metric("Surface Forecast Skill", _format_value(primary_skill, 6))
-        c3.metric("Surface Recon RMSE", _format_value(metrics.get("surface_recon_iv_rmse"), 6))
-        c4.metric("Forecast Butterfly Pred", _format_value(metrics.get("butterfly_violation_forecast_pred_mean"), 6))
+        c2.metric("Surface Forecast MAE", _format_value(metrics.get("surface_forecast_iv_mae"), 6))
+        c3.metric("Surface Forecast Skill", _format_value(primary_skill, 6))
+        c4.metric("Surface Recon RMSE", _format_value(metrics.get("surface_recon_iv_rmse"), 6))
+        c5.metric("Forecast Butterfly Pred", _format_value(metrics.get("butterfly_violation_forecast_pred_mean"), 6))
 
         _render_baseline_sections(metrics, run_dir=run_dir)
     else:
@@ -1691,12 +1851,13 @@ def _render_run_overview(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Surface Forecast RMSE", _format_value(metrics.get("surface_forecast_iv_rmse"), 6))
-    c2.metric("Surface Forecast Skill", _format_value(primary_skill, 6))
-    c3.metric("Surface Recon RMSE", _format_value(metrics.get("surface_recon_iv_rmse"), 6))
-    c4.metric("Forecast Butterfly Pred", _format_value(metrics.get("butterfly_violation_forecast_pred_mean"), 6))
-    c5.metric("Final Val Recon", _format_value(train_summary.get("final_val_recon"), 6))
+    c2.metric("Surface Forecast MAE", _format_value(metrics.get("surface_forecast_iv_mae"), 6))
+    c3.metric("Surface Forecast Skill", _format_value(primary_skill, 6))
+    c4.metric("Surface Recon RMSE", _format_value(metrics.get("surface_recon_iv_rmse"), 6))
+    c5.metric("Forecast Butterfly Pred", _format_value(metrics.get("butterfly_violation_forecast_pred_mean"), 6))
+    c6.metric("Final Val Recon", _format_value(train_summary.get("final_val_recon"), 6))
     st.caption("For full baseline diagnostics and detailed error breakdowns, use the Evaluation Diagnostics tab.")
 
     if latest_runs_by_symbol:
@@ -1710,6 +1871,7 @@ def _render_run_overview(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
                 "Primary baseline label",
                 "Forecast skill vs primary",
                 "Forecast skill vs tree",
+                "Forecast skill vs garch",
                 "Forecast skill vs parametric",
                 "Forecast skill vs persistence",
                 "Surface RMSE",
@@ -1717,6 +1879,11 @@ def _render_run_overview(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
                 "Surface edge (vs primary)",
                 "Surface RMSE baseline (persistence)",
                 "Surface edge (vs persistence)",
+                "Surface MAE",
+                "Surface MAE baseline (primary)",
+                "Surface MAE edge (vs primary)",
+                "Surface MAE baseline (persistence)",
+                "Surface MAE edge (vs persistence)",
                 "Forecast calendar abs gap (model)",
                 "Forecast calendar abs gap (tree)",
                 "Forecast calendar edge vs tree (gap)",
@@ -1812,15 +1979,20 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
     primary = _resolve_primary_non_persistence_baseline(metrics)
     primary_label = str(primary.get("label", "Primary Baseline"))
     rmse_model = _to_float(metrics.get("surface_forecast_iv_rmse"))
+    mae_model = _to_float(metrics.get("surface_forecast_iv_mae"))
     rmse_primary = _to_float(metrics.get(primary["rmse_key"]))
+    mae_primary = _to_float(metrics.get(primary["mae_key"]))
     rmse_persistence = _to_float(metrics.get("surface_forecast_iv_rmse_baseline_persistence"))
+    mae_persistence = _to_float(metrics.get("surface_forecast_iv_mae_baseline_persistence"))
     skill_primary = _to_float(metrics.get(primary["skill_key"]))
     skill_persistence = _to_float(metrics.get("surface_forecast_skill_mse_vs_persistence"))
 
     edge_rmse_primary, edge_rmse_primary_pct = _edge_vs_baseline(rmse_model, rmse_primary, better="lower")
     edge_rmse_pers, edge_rmse_pers_pct = _edge_vs_baseline(rmse_model, rmse_persistence, better="lower")
+    edge_mae_primary, edge_mae_primary_pct = _edge_vs_baseline(mae_model, mae_primary, better="lower")
+    edge_mae_pers, edge_mae_pers_pct = _edge_vs_baseline(mae_model, mae_persistence, better="lower")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric(
         f"RMSE Edge vs {primary_label}",
         _format_value(edge_rmse_primary, 6),
@@ -1832,10 +2004,20 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
         delta=(f"{edge_rmse_pers_pct:+.2f}%" if edge_rmse_pers_pct is not None else None),
     )
     c3.metric(
+        f"MAE Edge vs {primary_label}",
+        _format_value(edge_mae_primary, 6),
+        delta=(f"{edge_mae_primary_pct:+.2f}%" if edge_mae_primary_pct is not None else None),
+    )
+    c4.metric(
+        "MAE Edge vs Persistence",
+        _format_value(edge_mae_pers, 6),
+        delta=(f"{edge_mae_pers_pct:+.2f}%" if edge_mae_pers_pct is not None else None),
+    )
+    c5.metric(
         f"Forecast Skill vs {primary_label}",
         _format_value(skill_primary, 6),
     )
-    c4.metric(
+    c6.metric(
         "Forecast Skill vs Persistence",
         _format_value(skill_persistence, 6),
     )
@@ -1845,6 +2027,9 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
             {"metric": "RMSE", "series": "model", "value": rmse_model},
             {"metric": "RMSE", "series": f"primary ({primary_label})", "value": rmse_primary},
             {"metric": "RMSE", "series": "persistence", "value": rmse_persistence},
+            {"metric": "MAE", "series": "model", "value": mae_model},
+            {"metric": "MAE", "series": f"primary ({primary_label})", "value": mae_primary},
+            {"metric": "MAE", "series": "persistence", "value": mae_persistence},
         ]
     )
     values = values[np.isfinite(pd.to_numeric(values["value"], errors="coerce"))]
@@ -1867,6 +2052,8 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
         [
             {"comparison": f"RMSE vs {primary_label}", "edge": edge_rmse_primary},
             {"comparison": "RMSE vs Persistence", "edge": edge_rmse_pers},
+            {"comparison": f"MAE vs {primary_label}", "edge": edge_mae_primary},
+            {"comparison": "MAE vs Persistence", "edge": edge_mae_pers},
         ]
     )
     edges = edges[np.isfinite(pd.to_numeric(edges["edge"], errors="coerce"))]
@@ -1897,7 +2084,7 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
         if not by_dte.empty:
             dte_plot = by_dte.melt(
                 id_vars=["series", "dte"],
-                value_vars=["rmse"],
+                value_vars=[c for c in ("rmse", "mae") if c in by_dte.columns],
                 var_name="metric",
                 value_name="value",
             )
@@ -1908,7 +2095,8 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
                     x=alt.X("dte:Q", title="DTE"),
                     y=alt.Y("value:Q", title="Absolute error"),
                     color=alt.Color("series:N", title="Series"),
-                    tooltip=["series:N", "dte:Q", alt.Tooltip("value:Q", format=".6f")],
+                    strokeDash=alt.StrokeDash("metric:N", title="Metric"),
+                    tooltip=["series:N", "metric:N", "dte:Q", alt.Tooltip("value:Q", format=".6f")],
                 )
                 .properties(height=260)
             )
@@ -1917,7 +2105,7 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
         if not by_x.empty:
             x_plot = by_x.melt(
                 id_vars=["series", "moneyness_x"],
-                value_vars=["rmse"],
+                value_vars=[c for c in ("rmse", "mae") if c in by_x.columns],
                 var_name="metric",
                 value_name="value",
             )
@@ -1928,14 +2116,17 @@ def _render_overview_tab(run_dir: Path, latest_runs_by_symbol: dict[str, Path]) 
                     x=alt.X("moneyness_x:Q", title="Moneyness x=ln(K/S)"),
                     y=alt.Y("value:Q", title="Absolute error"),
                     color=alt.Color("series:N", title="Series"),
-                    tooltip=["series:N", "moneyness_x:Q", alt.Tooltip("value:Q", format=".6f")],
+                    strokeDash=alt.StrokeDash("metric:N", title="Metric"),
+                    tooltip=["series:N", "metric:N", "moneyness_x:Q", alt.Tooltip("value:Q", format=".6f")],
                 )
                 .properties(height=260)
             )
             st.altair_chart(chart_x, use_container_width=True)
 
         if not by_grid.empty:
-            for metric in ("rmse",):
+            for metric in ("rmse", "mae"):
+                if metric not in by_grid.columns:
+                    continue
                 grid = by_grid.copy()
                 grid[metric] = pd.to_numeric(grid[metric], errors="coerce")
                 grid = grid[np.isfinite(grid[metric])]

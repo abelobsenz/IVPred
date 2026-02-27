@@ -520,6 +520,9 @@ def _evaluate_command(ns: Any) -> None:
         baseline_factor_dim=int(getattr(ns, "baseline_factor_dim", 3)),
         baseline_ridge=float(getattr(ns, "baseline_ridge", 1e-4)),
         baseline_min_history=int(getattr(ns, "baseline_min_history", 40)),
+        enable_tree_baseline=bool(getattr(ns, "enable_tree_baseline", False)),
+        enable_garch_baseline=bool(getattr(ns, "enable_garch_baseline", False)),
+        garch_min_history=int(getattr(ns, "garch_min_history", 60)),
     )
     print(out_dir)
 
@@ -583,12 +586,22 @@ def _metric_subset_keys() -> list[str]:
         "surface_dynamics_focus_mode",
         "error_metric_mode",
         "surface_forecast_iv_rmse",
+        "surface_forecast_iv_mae",
         "surface_forecast_baseline_primary",
         "surface_forecast_iv_rmse_baseline_parametric",
+        "surface_forecast_iv_mae_baseline_parametric",
         "surface_forecast_skill_mse_vs_parametric",
+        "surface_forecast_iv_rmse_baseline_tree",
+        "surface_forecast_iv_mae_baseline_tree",
+        "surface_forecast_skill_mse_vs_tree",
+        "surface_forecast_iv_rmse_baseline_garch",
+        "surface_forecast_iv_mae_baseline_garch",
+        "surface_forecast_skill_mse_vs_garch",
         "surface_forecast_iv_rmse_baseline_persistence",
+        "surface_forecast_iv_mae_baseline_persistence",
         "surface_forecast_skill_mse_vs_persistence",
         "surface_recon_iv_rmse",
+        "surface_recon_iv_mae",
         "calendar_violation_pred_mean",
         "butterfly_violation_pred_mean",
         "calendar_violation_obs_mean",
@@ -645,12 +658,15 @@ def _experiment_plan_command(ns: Any) -> None:
         "baseline_factor_dim": int(getattr(ns, "baseline_factor_dim", 3)),
         "baseline_ridge": float(getattr(ns, "baseline_ridge", 1e-4)),
         "baseline_min_history": int(getattr(ns, "baseline_min_history", 40)),
+        "enable_tree_baseline": bool(getattr(ns, "enable_tree_baseline", False)),
+        "enable_garch_baseline": bool(getattr(ns, "enable_garch_baseline", False)),
+        "garch_min_history": int(getattr(ns, "garch_min_history", 60)),
         "seeds": seeds,
         "bundles": bundles,
         "notes": [
             "This plan applies only parameters currently supported by ivdyn training config.",
             "By default, runs include price supervision when joint lambdas are > 0; use --surface-dynamics-only to force surface-only.",
-            "Primary forecast baseline is tree-boosted next-day surface mapping, with persistence retained for reference.",
+            "Primary forecast baseline defaults to persistence-only reference; tree and GARCH baselines are opt-in.",
             "Unsupported suggestions are recorded per bundle in `unsupported_suggestions`.",
             "For front-tenor changes, rebuild dataset with custom --tenor-days if needed.",
         ],
@@ -715,6 +731,9 @@ def _experiment_plan_command(ns: Any) -> None:
                     baseline_factor_dim=int(getattr(ns, "baseline_factor_dim", 3)),
                     baseline_ridge=float(getattr(ns, "baseline_ridge", 1e-4)),
                     baseline_min_history=int(getattr(ns, "baseline_min_history", 40)),
+                    enable_tree_baseline=bool(getattr(ns, "enable_tree_baseline", False)),
+                    enable_garch_baseline=bool(getattr(ns, "enable_garch_baseline", False)),
+                    garch_min_history=int(getattr(ns, "garch_min_history", 60)),
                 ).resolve()
 
                 metrics_path = eval_dir / "metrics.json"
@@ -1732,6 +1751,24 @@ def _build_parser() -> ArgumentParser:
     p.add_argument("--baseline-factor-dim", type=int, default=3, help="Number of PCA factors for parametric surface baseline.")
     p.add_argument("--baseline-ridge", type=float, default=1e-4, help="Ridge regularization for factor HAR(1,5,22) baseline.")
     p.add_argument("--baseline-min-history", type=int, default=40, help="Minimum history days before parametric baseline fit.")
+    p.add_argument(
+        "--enable-tree-baseline",
+        action="store_true",
+        default=False,
+        help="Enable tree-boosted next-day surface baseline during evaluation (disabled by default).",
+    )
+    p.add_argument(
+        "--enable-garch-baseline",
+        action="store_true",
+        default=False,
+        help="Enable AR(1)-GARCH(1,1) IV baseline during evaluation (disabled by default).",
+    )
+    p.add_argument(
+        "--garch-min-history",
+        type=int,
+        default=60,
+        help="Minimum train+val history rows required per asset for GARCH baseline fit.",
+    )
     p.set_defaults(func=_evaluate_command)
 
     p = sub.add_parser("experiment-plan")
@@ -1853,6 +1890,24 @@ def _build_parser() -> ArgumentParser:
     p.add_argument("--baseline-factor-dim", type=int, default=3, help="Number of PCA factors for parametric surface baseline.")
     p.add_argument("--baseline-ridge", type=float, default=1e-4, help="Ridge regularization for factor HAR(1,5,22) baseline.")
     p.add_argument("--baseline-min-history", type=int, default=40, help="Minimum history days before parametric baseline fit.")
+    p.add_argument(
+        "--enable-tree-baseline",
+        action="store_true",
+        default=False,
+        help="Enable tree-boosted next-day surface baseline during plan evaluations.",
+    )
+    p.add_argument(
+        "--enable-garch-baseline",
+        action="store_true",
+        default=False,
+        help="Enable AR(1)-GARCH(1,1) IV baseline during plan evaluations.",
+    )
+    p.add_argument(
+        "--garch-min-history",
+        type=int,
+        default=60,
+        help="Minimum train+val history rows required per asset for GARCH baseline fit.",
+    )
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--price-risk-weight", type=float, default=1.0)
     p.add_argument("--exec-risk-weight", type=float, default=0.5)
