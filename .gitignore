@@ -1,4 +1,7 @@
-/outputs/
+/outputs/**
+!/outputs/**/
+!/outputs/**/02_dataset_JPM/
+!/outputs/**/02_dataset_JPM/**
 /.venv/
 /Options_chain.csv
 
